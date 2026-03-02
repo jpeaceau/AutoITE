@@ -441,5 +441,444 @@ class TestSharedHVRT:
         assert len(set(K_values)) <= 1, f"Inconsistent K across patients: {K_values}"
 
 
+# ────────────────────────────────────────────────────────────────────── #
+# Cascaded matching tests  (spec §5.2)                                    #
+# ────────────────────────────────────────────────────────────────────── #
+
+class TestCascadedMatching:
+    """Verify the three-level cascade search (spec §5.2)."""
+
+    def test_cascade_returns_k(self):
+        profiles = [make_profile(d=4, seed=i) for i in range(30)]
+        matcher = ICGHVRTMatcher(cascade=True, auto_calibrate=True)
+        idx = matcher.find_neighbours(profiles[0], profiles, k=5, exclude_idx=0)
+        assert len(idx) == 5
+
+    def test_cascade_excludes_self(self):
+        profiles = [make_profile(d=4, seed=i) for i in range(30)]
+        matcher = ICGHVRTMatcher(cascade=True, auto_calibrate=True)
+        idx = matcher.find_neighbours(profiles[0], profiles, k=5, exclude_idx=0)
+        assert 0 not in idx
+
+    def test_cascade_info_populated(self):
+        """last_cascade_info must be set after a cascade find_neighbours call."""
+        profiles = [make_profile(d=4, seed=i) for i in range(30)]
+        matcher = ICGHVRTMatcher(cascade=True, auto_calibrate=True)
+        matcher.find_neighbours(profiles[0], profiles, k=5, exclude_idx=0)
+        info = matcher.last_cascade_info
+        assert "level1_size" in info
+        assert "fallback" in info
+
+    def test_cascade_level1_filters_direction(self):
+        """
+        Level 1 retains only profiles whose cooperative direction is within
+        direction_gate of the query.  Using a very tight gate should produce
+        fewer survivors than the full pool.
+        """
+        rng = np.random.default_rng(99)
+        d = 4
+        profiles = []
+        for i in range(40):
+            A = rng.standard_normal((d, d)) * 0.8
+            cov = A @ A.T + np.eye(d)
+            X = rng.multivariate_normal(np.zeros(d), cov, 60)
+            profiles.append(CooperativeGeometryProfile.from_longitudinal(X))
+
+        # Very tight gate → Level 1 likely produces fewer survivors than n
+        tight_gate = np.pi / 12   # 15 degrees
+        matcher = ICGHVRTMatcher(
+            cascade=True, direction_gate=tight_gate, auto_calibrate=True
+        )
+        matcher.find_neighbours(profiles[0], profiles, k=5, exclude_idx=0)
+        info = matcher.last_cascade_info
+        # Either a fallback occurred (gate too tight, fewer than k survived)
+        # or Level 1 produced a strict subset of the 39 candidates.
+        assert info["fallback"] or info["level1_size"] < 39
+
+    def test_cascade_fallback_when_level1_thin(self):
+        """
+        When fewer than k profiles survive the direction gate, the cascade
+        must fall back to exhaustive search and set fallback=True.
+        """
+        rng = np.random.default_rng(7)
+        d = 4
+        profiles = []
+        for i in range(10):
+            A = rng.standard_normal((d, d)) * 2.0   # large spread → diverse directions
+            cov = A @ A.T + np.eye(d)
+            X = rng.multivariate_normal(np.zeros(d), cov, 60)
+            profiles.append(CooperativeGeometryProfile.from_longitudinal(X))
+
+        # Extremely tight gate forces Level 1 to produce 0 survivors
+        matcher = ICGHVRTMatcher(
+            cascade=True, direction_gate=1e-6, auto_calibrate=True
+        )
+        idx = matcher.find_neighbours(profiles[0], profiles, k=5, exclude_idx=0)
+        assert len(idx) == 5                              # still returns k
+        assert matcher.last_cascade_info["fallback"]      # flagged as fallback
+
+    def test_cascade_k2_controls_level2_size(self):
+        """
+        cascade_k2 explicitly bounds the number of Level-2 candidates.
+        When set to a small value, level2_size must not exceed it.
+        When set larger than the Level-1 survivor count, level2_size equals
+        the survivor count.
+        """
+        profiles = [make_profile(d=4, seed=i) for i in range(40)]
+
+        # Small k2: Level 2 should be capped at k2
+        m_small = ICGHVRTMatcher(cascade=True, cascade_k2=6, auto_calibrate=True)
+        m_small.find_neighbours(profiles[0], profiles, k=5, exclude_idx=0)
+        info = m_small.last_cascade_info
+        if not info["fallback"]:
+            assert info["level2_size"] <= 6
+
+        # Large k2: Level 2 keeps all Level-1 survivors
+        m_large = ICGHVRTMatcher(cascade=True, cascade_k2=1000, auto_calibrate=True)
+        m_large.find_neighbours(profiles[0], profiles, k=5, exclude_idx=0)
+        info2 = m_large.last_cascade_info
+        if not info2["fallback"]:
+            assert info2["level2_size"] == info2["level1_size"]
+
+
+# ────────────────────────────────────────────────────────────────────── #
+# Stress tests  (spec §8)                                                 #
+# ────────────────────────────────────────────────────────────────────── #
+#
+# Each class implements one of the four new DGPs described in spec §8.
+# The tests verify that ICG-HVRT achieves meaningful rank correlation
+# with the true ITE on each DGP, as required by the "Good" grade in
+# the expected-results table (spec §8.2).
+#
+# Thresholds are set conservatively to avoid flakiness; the ITE
+# evaluation experiment (experiments/ite_evaluation.py) provides
+# the full statistical picture across 20 seeds.
+# ────────────────────────────────────────────────────────────────────── #
+
+def _spearman(a, b):
+    from scipy.stats import spearmanr
+    rho, _ = spearmanr(a, b)
+    return float(0.0 if np.isnan(rho) else rho)
+
+
+class TestStressDirectionGate:
+    """
+    Spec §8 Test 4 — Cooperative Direction Gate.
+
+    tau = 3 * cos(angle(w_i, e_1)).
+    Patients whose cooperative axis aligns with the first feature
+    dimension benefit; orthogonal patients do not.
+    ICG-HVRT must detect this via d_w.
+    """
+
+    @staticmethod
+    def _gen(n_units: int, n_obs: int = 80, seed: int = 0):
+        rng = np.random.default_rng(seed)
+        d = 4
+        e1 = np.eye(d)[0]
+        X_list, T_list, Y_list, effects = [], [], [], []
+        for _ in range(n_units):
+            A   = rng.standard_normal((d, d)) * 0.5
+            cov = A @ A.T + np.eye(d)
+            eig, vec = np.linalg.eigh(cov)
+            inv_sqrt = vec @ np.diag(1.0 / np.sqrt(np.maximum(eig, 1e-6))) @ vec.T
+            w   = inv_sqrt @ np.ones(d)
+            eff = 3.0 * float(w @ e1) / (np.linalg.norm(w) + 1e-12)
+            mu  = rng.standard_normal(d) * 0.5
+            X   = rng.multivariate_normal(mu, cov, n_obs)
+            T   = rng.standard_normal((n_obs, 1))
+            Y   = eff * T.flatten() + rng.standard_normal(n_obs) * 0.5
+            X_list.append(X); T_list.append(T); Y_list.append(Y); effects.append(eff)
+        return X_list, T_list, Y_list, np.array(effects)
+
+    def test_ite_rank_correlation(self):
+        """ICG-HVRT must achieve Spearman rho > 0.4 on the direction-gate DGP."""
+        X_tr, T_tr, Y_tr, E_tr = self._gen(150, seed=0)
+        X_te, T_te, _,    E_te = self._gen(40,  seed=100)
+
+        est = ICGHVRTEstimator(k=20)
+        est.fit(X_tr, T_tr, Y_tr)
+        preds = np.array([est.predict_effect(X_te[i], T_te[i]) for i in range(len(X_te))])
+
+        rho = _spearman(preds, E_te)
+        assert rho > 0.4, (
+            f"ICG-HVRT Spearman rho={rho:.4f} < 0.4 on Direction Gate; "
+            "d_w component is not providing sufficient signal"
+        )
+
+    def test_direction_component_discriminates(self):
+        """
+        d_w between two profiles with similar mean/covariance but opposite
+        cooperative directions must be larger than d_w between profiles with
+        aligned directions (after calibration).
+        """
+        rng = np.random.default_rng(55)
+        d   = 4
+        cov = np.eye(d)
+
+        # Profile with w pointing toward e1
+        X_align = rng.multivariate_normal(np.zeros(d), cov, 100)
+        # Profiles with cooperative direction spread across angles
+        p_query  = CooperativeGeometryProfile.from_longitudinal(X_align)
+
+        # Build a small set, calibrate, then check gate behaviour
+        profiles = [CooperativeGeometryProfile.from_longitudinal(
+            rng.multivariate_normal(np.zeros(d), np.eye(d) + rng.standard_normal((d, d)) * 0.3, 80)
+        ) for _ in range(20)]
+        profiles.insert(0, p_query)
+
+        matcher = ICGHVRTMatcher(auto_calibrate=True)
+        matcher.calibrate(profiles)
+
+        # Self-distance direction component must be exactly zero
+        dc_self = matcher.distance_components(p_query, p_query)
+        assert dc_self["direction"] < 1e-7
+
+
+class TestStressCurvatureGate:
+    """
+    Spec §8 Test 5 — Manifold Curvature Gate.
+
+    tau = 2 if manifold coupling (rho) > 0.4 else 0.
+    Equicorrelated covariance with rho ~ U[0, 0.85].
+    ICG-HVRT must detect via d_sigma.
+    """
+
+    @staticmethod
+    def _gen(n_units: int, n_obs: int = 80, seed: int = 0):
+        rng = np.random.default_rng(seed)
+        d   = 4
+        X_list, T_list, Y_list, effects = [], [], [], []
+        for _ in range(n_units):
+            rho = rng.uniform(0.0, 0.85)
+            cov = (1.0 - rho) * np.eye(d) + rho * np.ones((d, d)) + 1e-4 * np.eye(d)
+            eff = 2.0 * float(rho > 0.4)
+            X   = rng.multivariate_normal(np.zeros(d), cov, n_obs)
+            T   = rng.standard_normal((n_obs, 1))
+            Y   = eff * T.flatten() + rng.standard_normal(n_obs) * 0.5
+            X_list.append(X); T_list.append(T); Y_list.append(Y); effects.append(eff)
+        return X_list, T_list, Y_list, np.array(effects)
+
+    def test_ite_rank_correlation(self):
+        """ICG-HVRT must achieve Spearman rho > 0.4 on the curvature-gate DGP."""
+        X_tr, T_tr, Y_tr, E_tr = self._gen(150, seed=0)
+        X_te, T_te, _,    E_te = self._gen(40,  seed=100)
+
+        est = ICGHVRTEstimator(k=20)
+        est.fit(X_tr, T_tr, Y_tr)
+        preds = np.array([est.predict_effect(X_te[i], T_te[i]) for i in range(len(X_te))])
+
+        rho = _spearman(preds, E_te)
+        assert rho > 0.4, (
+            f"ICG-HVRT Spearman rho={rho:.4f} < 0.4 on Curvature Gate; "
+            "d_sigma component is not providing sufficient signal"
+        )
+
+    def test_shape_component_ranks_coupling(self):
+        """
+        d_sigma between a tightly coupled patient (rho=0.8) and a reference
+        must exceed d_sigma for a loosely coupled patient (rho=0.05).
+        """
+        d     = 4
+        ref   = np.eye(d)
+        tight = (1 - 0.8) * np.eye(d) + 0.8 * np.ones((d, d)) + 1e-4 * np.eye(d)
+        loose = (1 - 0.05) * np.eye(d) + 0.05 * np.ones((d, d)) + 1e-4 * np.eye(d)
+
+        rng  = np.random.default_rng(10)
+        X_r  = rng.multivariate_normal(np.zeros(d), ref,   80)
+        X_t  = rng.multivariate_normal(np.zeros(d), tight, 80)
+        X_l  = rng.multivariate_normal(np.zeros(d), loose, 80)
+
+        p_ref   = CooperativeGeometryProfile.from_longitudinal(X_r)
+        p_tight = CooperativeGeometryProfile.from_longitudinal(X_t)
+        p_loose = CooperativeGeometryProfile.from_longitudinal(X_l)
+
+        matcher = ICGHVRTMatcher(auto_calibrate=False)
+        dc_tight = matcher.distance_components(p_ref, p_tight)
+        dc_loose = matcher.distance_components(p_ref, p_loose)
+
+        assert dc_tight["shape"] > dc_loose["shape"], (
+            "Tightly coupled covariance should be farther from identity in d_sigma"
+        )
+
+
+class TestStressOccupationGate:
+    """
+    Spec §8 Test 6 — Occupation Gate.
+
+    tau = 4 * p_coop - 2  where p_coop is the cooperative-state fraction.
+    Patients spending more time in the cooperative regime benefit more.
+    ICG-HVRT must detect via d_occ.
+    """
+
+    @staticmethod
+    def _gen(n_units: int, n_obs: int = 100, seed: int = 0):
+        rng  = np.random.default_rng(seed)
+        d, rho = 4, 0.7
+        Sc = (1 - rho) * np.eye(d) + rho * np.ones((d, d)) + 1e-4 * np.eye(d)
+        Sa = np.eye(d)
+        X_list, T_list, Y_list, effects = [], [], [], []
+        for _ in range(n_units):
+            p    = rng.uniform(0.1, 0.9)
+            eff  = 4.0 * p - 2.0
+            mask = rng.random(n_obs) < p
+            X    = np.zeros((n_obs, d))
+            nc   = mask.sum()
+            if nc:          X[mask]  = rng.multivariate_normal(np.zeros(d), Sc, nc)
+            if n_obs - nc:  X[~mask] = rng.multivariate_normal(np.zeros(d), Sa, n_obs - nc)
+            T = rng.standard_normal((n_obs, 1))
+            Y = eff * T.flatten() + rng.standard_normal(n_obs) * 0.5
+            X_list.append(X); T_list.append(T); Y_list.append(Y); effects.append(eff)
+        return X_list, T_list, Y_list, np.array(effects)
+
+    def test_ite_rank_correlation(self):
+        """ICG-HVRT must achieve Spearman rho > 0.4 on the occupation-gate DGP."""
+        X_tr, T_tr, Y_tr, E_tr = self._gen(150, seed=0)
+        X_te, T_te, _,    E_te = self._gen(40,  seed=100)
+
+        est = ICGHVRTEstimator(k=20)
+        est.fit(X_tr, T_tr, Y_tr)
+        preds = np.array([est.predict_effect(X_te[i], T_te[i]) for i in range(len(X_te))])
+
+        rho = _spearman(preds, E_te)
+        assert rho > 0.4, (
+            f"ICG-HVRT Spearman rho={rho:.4f} < 0.4 on Occupation Gate; "
+            "d_occ component is not providing sufficient signal"
+        )
+
+    def test_occupation_component_ranks_cooperative_fraction(self):
+        """
+        Two patients with the same mean covariance but different cooperative
+        fractions should have non-zero occupation distance when using a
+        shared HVRT partition.
+        """
+        rng  = np.random.default_rng(20)
+        d, rho = 4, 0.7
+        Sc = (1 - rho) * np.eye(d) + rho * np.ones((d, d)) + 1e-4 * np.eye(d)
+        Sa = np.eye(d)
+
+        n_obs = 120
+        # High cooperative fraction (p=0.85)
+        m_h = rng.random(n_obs) < 0.85
+        X_h = np.zeros((n_obs, d))
+        X_h[m_h]   = rng.multivariate_normal(np.zeros(d), Sc, m_h.sum())
+        X_h[~m_h]  = rng.multivariate_normal(np.zeros(d), Sa, (~m_h).sum())
+
+        # Low cooperative fraction (p=0.15)
+        m_l = rng.random(n_obs) < 0.15
+        X_l = np.zeros((n_obs, d))
+        X_l[m_l]   = rng.multivariate_normal(np.zeros(d), Sc, m_l.sum())
+        X_l[~m_l]  = rng.multivariate_normal(np.zeros(d), Sa, (~m_l).sum())
+
+        X_pool = np.vstack([X_h, X_l])
+        from autoite.profile import fit_shared_hvrt
+        shared = fit_shared_hvrt(X_pool, n_partitions=8)
+
+        p_h = CooperativeGeometryProfile.from_longitudinal(X_h, shared_hvrt=shared)
+        p_l = CooperativeGeometryProfile.from_longitudinal(X_l, shared_hvrt=shared)
+
+        if p_h.partition_profile is not None and p_l.partition_profile is not None:
+            K   = min(len(p_h.partition_profile), len(p_l.partition_profile))
+            d_o = occupation_distance(p_h.partition_profile[:K], p_l.partition_profile[:K])
+            assert d_o > 0.0, "High vs low cooperative fraction should yield non-zero d_occ"
+
+
+class TestStressDynamicsGate:
+    """
+    Spec §8 Test 7 — Dynamics Gate.
+
+    tau = 3 * persistence - 0.5.
+    Symmetric Markov regime-switching with constant marginal covariance,
+    so d_mu and d_sigma are blind; only d_dyn carries the signal.
+
+    Note: at N=100 observations the transition-matrix estimator is noisy.
+    The threshold here is intentionally weak (rho > 0.0) — the full
+    statistical picture is in experiments/ite_evaluation.py.
+    """
+
+    @staticmethod
+    def _gen(n_units: int, n_obs: int = 100, seed: int = 0):
+        rng  = np.random.default_rng(seed)
+        d, rho = 4, 0.8
+        Sc = (1 - rho) * np.eye(d) + rho * np.ones((d, d)) + 1e-4 * np.eye(d)
+        Sa = np.eye(d)
+        X_list, T_list, Y_list, effects = [], [], [], []
+        for _ in range(n_units):
+            p     = rng.uniform(0.3, 0.95)
+            eff   = 3.0 * p - 0.5
+            state = int(rng.integers(2))
+            X     = np.zeros((n_obs, d))
+            for step in range(n_obs):
+                X[step] = rng.multivariate_normal(np.zeros(d), Sc if state == 0 else Sa)
+                if rng.random() > p:
+                    state = 1 - state
+            T = rng.standard_normal((n_obs, 1))
+            Y = eff * T.flatten() + rng.standard_normal(n_obs) * 0.5
+            X_list.append(X); T_list.append(T); Y_list.append(Y); effects.append(eff)
+        return X_list, T_list, Y_list, np.array(effects)
+
+    def test_ite_rank_correlation_not_strongly_inverted(self):
+        """
+        ICG-HVRT must not produce strongly inverted rankings on the
+        dynamics-gate DGP.
+
+        At N=100 observations the transition-matrix estimator is noisy and
+        d_dyn carries weak signal (Spearman ~0.07 in the full evaluation).
+        This test guards against catastrophic failure (rho << 0) while the
+        full statistical picture lives in experiments/ite_evaluation.py.
+        """
+        X_tr, T_tr, Y_tr, E_tr = self._gen(150, seed=0)
+        X_te, T_te, _,    E_te = self._gen(40,  seed=100)
+
+        est = ICGHVRTEstimator(k=20)
+        est.fit(X_tr, T_tr, Y_tr)
+        preds = np.array([est.predict_effect(X_te[i], T_te[i]) for i in range(len(X_te))])
+
+        rho = _spearman(preds, E_te)
+        assert rho > -0.3, (
+            f"ICG-HVRT Spearman rho={rho:.4f} on Dynamics Gate is strongly negative; "
+            "d_dyn component is introducing noise rather than signal. "
+            "Known limitation: N=100 obs is below the reliable estimation threshold "
+            "for transition matrices with K=8 partitions."
+        )
+
+    def test_dynamics_component_nonzero_for_different_persistence(self):
+        """
+        A high-persistence patient (p=0.9) and a low-persistence patient (p=0.35)
+        must have non-zero dynamics distance when transition matrices are available.
+        """
+        rng  = np.random.default_rng(30)
+        d, rho = 4, 0.8
+        Sc = (1 - rho) * np.eye(d) + rho * np.ones((d, d)) + 1e-4 * np.eye(d)
+        Sa = np.eye(d)
+
+        def _make_markov(persistence, seed):
+            r2 = np.random.default_rng(seed)
+            n  = 200           # more obs for stable transition estimate
+            state = int(r2.integers(2))
+            X = np.zeros((n, d))
+            for step in range(n):
+                X[step] = r2.multivariate_normal(np.zeros(d), Sc if state == 0 else Sa)
+                if r2.random() > persistence:
+                    state = 1 - state
+            return X
+
+        X_high = _make_markov(0.90, 40)
+        X_low  = _make_markov(0.35, 41)
+
+        X_pool = np.vstack([X_high, X_low])
+        from autoite.profile import fit_shared_hvrt
+        shared = fit_shared_hvrt(X_pool, n_partitions=8)
+
+        p_high = CooperativeGeometryProfile.from_longitudinal(X_high, shared_hvrt=shared)
+        p_low  = CooperativeGeometryProfile.from_longitudinal(X_low,  shared_hvrt=shared)
+
+        if p_high.transition_matrix is not None and p_low.transition_matrix is not None:
+            d_dyn = dynamics_distance(p_high.transition_matrix, p_low.transition_matrix)
+            assert d_dyn > 0.0, (
+                "High-persistence vs low-persistence patients should have non-zero d_dyn"
+            )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

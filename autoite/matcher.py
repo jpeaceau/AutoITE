@@ -2,6 +2,19 @@
 ICGHVRTMatcher: five-component cooperative geometry distance for patient matching.
 
 d(i, j) = alpha_1*d_mu + alpha_2*d_w + alpha_3*d_sigma + alpha_4*d_occ + alpha_5*d_dyn
+
+Matching modes
+--------------
+cascade=False (default)
+    Exhaustive weighted-sum search across all training patients.
+
+cascade=True  (spec §5.2)
+    Three-level hierarchical search:
+      Level 1 — Direction filter: retain j where d_w(i,j) < direction_gate
+      Level 2 — Shape match:     among survivors, keep k2 nearest by d_sigma
+      Level 3 — Occ+Dyn match:  among those, keep k nearest by d_occ + d_dyn
+    Falls back to exhaustive when Level 1 produces fewer than k survivors.
+    Cascade info is stored in last_cascade_info after each call.
 """
 import numpy as np
 from typing import Dict, List, Optional
@@ -32,6 +45,10 @@ class ICGHVRTMatcher:
                      geometrically unsafe.  Default pi/4 (~45 degrees).
     auto_calibrate : if True, call calibrate() before each find_neighbours()
                      unless already calibrated.
+    cascade : if True, use the hierarchical three-level cascade (spec §5.2) instead
+              of exhaustive weighted-sum search.  Default False.
+    cascade_k2 : number of Level-2 (shape-match) candidates to carry into Level 3.
+                 None = auto (3*k, capped at the Level-1 survivor count).
     """
 
     def __init__(
@@ -43,6 +60,8 @@ class ICGHVRTMatcher:
         alpha_dynamics: float = 1.0,
         direction_gate: float = np.pi / 4,
         auto_calibrate: bool = True,
+        cascade: bool = False,
+        cascade_k2: Optional[int] = None,
     ) -> None:
         self.alpha_levels = alpha_levels
         self.alpha_direction = alpha_direction
@@ -51,6 +70,8 @@ class ICGHVRTMatcher:
         self.alpha_dynamics = alpha_dynamics
         self.direction_gate = direction_gate
         self.auto_calibrate = auto_calibrate
+        self.cascade = cascade
+        self.cascade_k2 = cascade_k2
 
         # Internal calibration scales (set by calibrate())
         self._scale_levels: float = 1.0
@@ -59,6 +80,9 @@ class ICGHVRTMatcher:
         self._scale_occ: float = 1.0
         self._scale_dyn: float = 1.0
         self._calibrated: bool = False
+
+        # Populated by find_neighbours() when cascade=True
+        self.last_cascade_info: Dict = {}
 
     # ------------------------------------------------------------------ #
     # Calibration                                                          #
@@ -181,6 +205,10 @@ class ICGHVRTMatcher:
         """Scalar five-component distance between two profiles."""
         return self.distance_components(p_i, p_j)["total"]
 
+    # ------------------------------------------------------------------ #
+    # Neighbour search                                                     #
+    # ------------------------------------------------------------------ #
+
     def find_neighbours(
         self,
         query_profile: CooperativeGeometryProfile,
@@ -197,17 +225,147 @@ class ICGHVRTMatcher:
         training_profiles : list of training profiles
         k : number of nearest neighbours to return
         exclude_idx : index to skip (for leave-one-out cross-validation)
+
+        When cascade=True, self.last_cascade_info is populated with:
+          level1_size  -- candidates surviving the direction filter
+          level2_size  -- candidates surviving the shape match
+          level3_size  -- final neighbourhood size (= k unless fallback)
+          fallback     -- True if Level 1 was too thin and exhaustive was used
         """
         if self.auto_calibrate and not self._calibrated:
             self.calibrate(training_profiles)
 
         n = len(training_profiles)
-        k = min(k, n - (1 if exclude_idx is not None else 0))
+        k_eff = min(k, n - (1 if exclude_idx is not None else 0))
 
+        if self.cascade:
+            return self._cascade_search(query_profile, training_profiles, k_eff, exclude_idx)
+        return self._exhaustive_search(query_profile, training_profiles, k_eff, exclude_idx)
+
+    # ------------------------------------------------------------------ #
+    # Private search implementations                                       #
+    # ------------------------------------------------------------------ #
+
+    def _exhaustive_search(
+        self,
+        query_profile: CooperativeGeometryProfile,
+        training_profiles: List[CooperativeGeometryProfile],
+        k: int,
+        exclude_idx: Optional[int] = None,
+    ) -> np.ndarray:
+        """Weighted-sum search across all training patients."""
+        n = len(training_profiles)
         dists = np.full(n, np.inf)
         for j, p_j in enumerate(training_profiles):
             if j == exclude_idx:
                 continue
             dists[j] = self.distance(query_profile, p_j)
-
         return np.argsort(dists)[:k]
+
+    def _cascade_search(
+        self,
+        query_profile: CooperativeGeometryProfile,
+        training_profiles: List[CooperativeGeometryProfile],
+        k: int,
+        exclude_idx: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        Hierarchical three-level cascade (spec §5.2).
+
+        Level 1 — Cooperative Direction Filter
+            Retain j where d_w(i, j) < direction_gate.
+            O(n · d).
+
+        Level 2 — Manifold Shape Match
+            Among Level-1 survivors, keep the k2 nearest by d_sigma.
+            O(|L1| · d³).
+
+        Level 3 — Occupation + Dynamics Match
+            Among Level-2 survivors, keep the k nearest by
+            alpha_occupation*d_occ + alpha_dynamics*d_dyn.
+            Falls back to full weighted-sum within Level-2 when
+            neither partition profiles nor transition matrices are available.
+            O(|L2| · K²).
+        """
+        # ── Level 1: Cooperative Direction Filter ──────────────────── #
+        level1: List[int] = []
+        for j, p_j in enumerate(training_profiles):
+            if j == exclude_idx:
+                continue
+            d_w_raw = cooperative_direction_distance(
+                query_profile.cooperative_direction, p_j.cooperative_direction
+            )
+            if d_w_raw < self.direction_gate:
+                level1.append(j)
+
+        # Fallback when Level 1 is too thin to supply k neighbours
+        if len(level1) < k:
+            self.last_cascade_info = {
+                "level1_size": len(level1),
+                "level2_size": 0,
+                "level3_size": 0,
+                "fallback": True,
+            }
+            return self._exhaustive_search(query_profile, training_profiles, k, exclude_idx)
+
+        # ── Level 2: Manifold Shape Match ──────────────────────────── #
+        k2 = (
+            self.cascade_k2
+            if self.cascade_k2 is not None
+            else min(k * 3, len(level1))
+        )
+        k2 = min(k2, len(level1))
+
+        shape_dists = sorted(
+            (
+                (j, log_euclidean_distance(query_profile.sigma, training_profiles[j].sigma)
+                 / self._scale_shape)
+                for j in level1
+            ),
+            key=lambda x: x[1],
+        )
+        level2 = [j for j, _ in shape_dists[:k2]]
+
+        # ── Level 3: Occupation + Dynamics Match ───────────────────── #
+        dyn_dists = []
+        has_longitudinal = False
+        for j in level2:
+            p_j = training_profiles[j]
+            d_occ = 0.0
+            if query_profile.partition_profile is not None and p_j.partition_profile is not None:
+                K = min(len(query_profile.partition_profile), len(p_j.partition_profile))
+                d_occ = (
+                    occupation_distance(
+                        query_profile.partition_profile[:K], p_j.partition_profile[:K]
+                    )
+                    / self._scale_occ
+                )
+                has_longitudinal = True
+            d_dyn = 0.0
+            if query_profile.transition_matrix is not None and p_j.transition_matrix is not None:
+                d_dyn = (
+                    dynamics_distance(query_profile.transition_matrix, p_j.transition_matrix)
+                    / self._scale_dyn
+                )
+                has_longitudinal = True
+            dyn_dists.append((j, self.alpha_occupation * d_occ + self.alpha_dynamics * d_dyn))
+
+        # When occ+dyn provide no signal (static-only profiles), fall back to
+        # full weighted-sum distance within the Level-2 candidate set so Level 3
+        # still provides useful ranking rather than arbitrary ordering.
+        if not has_longitudinal:
+            dyn_dists = [
+                (j, self.distance(query_profile, training_profiles[j]))
+                for j in level2
+            ]
+
+        dyn_dists.sort(key=lambda x: x[1])
+        final_idx = np.array([j for j, _ in dyn_dists[:k]])
+
+        self.last_cascade_info = {
+            "level1_size": len(level1),
+            "level2_size": len(level2),
+            "level3_size": int(len(final_idx)),
+            "fallback": False,
+        }
+        return final_idx
