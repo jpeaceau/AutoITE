@@ -1,88 +1,257 @@
 """
-ICGHVRTMatcher: five-component cooperative geometry distance for patient matching.
+ICGHVRTMatcher: eight-component cooperative cone distance for patient matching.
 
-d(i, j) = alpha_1*d_mu + alpha_2*d_w + alpha_3*d_sigma + alpha_4*d_occ + alpha_5*d_dyn
+Distance structure (ICG-HVRT v0.2.0)
+--------------------------------------
+All eight components are combined into a single unified weighted distance.
+k-nearest-neighbours are selected by this total distance — no hard gate.
 
-Matching modes
---------------
-cascade=False (default)
-    Exhaustive weighted-sum search across all training patients.
+Identity components (cone family compatibility):
+  d_axis        Angular distance between cooperative axes v+
+  d_opening     L2 distance between directional half-angle profiles
+  d_eccentricity |log(ecc_i) - log(ecc_j)| — cone circularity difference
+  d_orientation  Procrustes distance between anti-cooperative frames V-
 
-cascade=True  (spec §5.2)
-    Three-level hierarchical search:
-      Level 1 — Direction filter: retain j where d_w(i,j) < direction_gate
-      Level 2 — Shape match:     among survivors, keep k2 nearest by d_sigma
-      Level 3 — Occ+Dyn match:  among those, keep k nearest by d_occ + d_dyn
-    Falls back to exhaustive when Level 1 produces fewer than k survivors.
-    Cascade info is stored in last_cascade_info after each call.
+State components (where on the cone the patient currently sits):
+  d_mu_coop     Mean shift along the shared cooperative axis
+  d_mu_perp     Mean shift perpendicular to the cooperative axis
+  d_occ         Wasserstein-1 occupation distance
+  d_dyn         Frobenius transition-matrix distance
+
+Design rationale
+----------------
+A hard gate (exclude patients whose identity distance exceeds a threshold)
+would impose binary decisions on a continuous geometric signal.  Instead,
+large identity components inflate the total distance, naturally pushing
+geometrically incompatible matches down the k-NN ranking without exclusion.
+The 'identity_distance' value in distance_components() exposes the identity
+contribution as an uncertainty signal: high identity_distance among the k
+selected neighbours means the best available matches are geometrically poor.
+
+By coupling samples through their cone geometry, every training patient is
+automatically weighted by their structural compatibility with the query —
+latent and observable geometry are jointly scrutinised in the single ranking.
 """
 import numpy as np
 from typing import Dict, List, Optional
 
 from .profile import CooperativeGeometryProfile
+
+# Optional C++ extension — loaded once at import time.
+# Falls back to pure Python silently if the extension is not built.
+try:
+    from . import _core as _cpp
+    _HAS_CPP = True
+except ImportError:
+    _cpp = None
+    _HAS_CPP = False
 from .distances import (
-    euclidean_mean_distance,
-    cooperative_direction_distance,
-    log_euclidean_distance,
+    ConeIdentity,
+    cooperative_mean_distance,
     occupation_distance,
     dynamics_distance,
 )
 
 
+def _pack_profiles(profiles: list, K: int = 0) -> dict:
+    """
+    Pack a list of CooperativeGeometryProfiles into flat C-contiguous numpy
+    arrays suitable for the C++ compute_distances / compute_raw_cache kernels.
+
+    Called once after calibrate(); result stored as self._tr_packed.
+
+    Returns a dict with keys:
+      axes, eccentricities, openings, anti_coops,
+      mus, coop_dirs, partitions, transitions,
+      geo_reliable, has_partition, has_transition,
+      N, d, dp1, K
+    """
+    N = len(profiles)
+    if N == 0:
+        return {}
+    d   = profiles[0].d
+    dp1 = d - 1
+
+    # Infer K from largest partition profile present.
+    if K == 0:
+        for p in profiles:
+            if p.partition_profile is not None:
+                K = max(K, len(p.partition_profile))
+
+    axes           = np.zeros((N, d),           dtype=np.float64)
+    eccentricities = np.zeros(N,                dtype=np.float64)
+    # dp1 may be 0 for 1-D data; keep at least shape (N,1) for contiguity.
+    openings   = np.zeros((N, max(dp1, 1)),      dtype=np.float64)
+    anti_coops = np.zeros((N, max(d * dp1, 1)), dtype=np.float64)
+    mus        = np.zeros((N, d),               dtype=np.float64)
+    coop_dirs  = np.zeros((N, d),               dtype=np.float64)
+    partitions  = np.zeros((N, max(K, 1)),      dtype=np.float64)
+    transitions = np.zeros((N, max(K * K, 1)),  dtype=np.float64)
+    geo_reliable   = np.zeros(N, dtype=np.int32)
+    has_partition  = np.zeros(N, dtype=np.int32)
+    has_transition = np.zeros(N, dtype=np.int32)
+
+    for i, p in enumerate(profiles):
+        mus[i]       = p.mu
+        coop_dirs[i] = p.cooperative_direction
+        geo_reliable[i] = int(p.geometry_reliable)
+
+        ci = p.cone_identity
+        if ci is not None and dp1 > 0:
+            axes[i]           = ci.axis
+            eccentricities[i] = ci.eccentricity
+            n_ang = min(len(ci.opening_profile), dp1)
+            if n_ang > 0:
+                openings[i, :n_ang] = ci.opening_profile[:n_ang]
+            V     = ci.anti_cooperative_frame
+            n_col = min(V.shape[1], dp1)
+            if n_col > 0:
+                # Store (d, n_col) row-major: V[r,c] -> anti_coops[i, r*dp1+c].
+                # V is a C-contiguous (d, d-1) array; ravel() gives row-major.
+                anti_coops[i, :d * n_col] = V[:, :n_col].ravel()
+
+        if p.partition_profile is not None and K > 0:
+            kp = min(len(p.partition_profile), K)
+            partitions[i, :kp] = p.partition_profile[:kp]
+            has_partition[i]   = 1
+
+        if p.transition_matrix is not None and K > 0:
+            km = min(p.transition_matrix.shape[0], K)
+            transitions[i, :km * km] = p.transition_matrix[:km, :km].ravel()
+            has_transition[i]        = 1
+
+    # Trim to actual dimensions (no padding columns).
+    op_arr = np.ascontiguousarray(openings[:, :dp1]    if dp1 > 0 else openings[:, :0])
+    ac_arr = np.ascontiguousarray(anti_coops[:, :d*dp1] if dp1 > 0 else anti_coops[:, :0])
+    pa_arr = np.ascontiguousarray(partitions[:, :K]     if K  > 0 else partitions[:, :0])
+    tr_arr = np.ascontiguousarray(transitions[:, :K*K]  if K  > 0 else transitions[:, :0])
+
+    return dict(
+        axes           = np.ascontiguousarray(axes),
+        eccentricities = np.ascontiguousarray(eccentricities),
+        openings       = op_arr,
+        anti_coops     = ac_arr,
+        mus            = np.ascontiguousarray(mus),
+        coop_dirs      = np.ascontiguousarray(coop_dirs),
+        partitions     = pa_arr,
+        transitions    = tr_arr,
+        geo_reliable   = np.ascontiguousarray(geo_reliable),
+        has_partition  = np.ascontiguousarray(has_partition),
+        has_transition = np.ascontiguousarray(has_transition),
+        N=N, d=d, dp1=dp1, K=K,
+    )
+
+
+def _pack_query(profile: "CooperativeGeometryProfile", K: int, dp1: int) -> dict:
+    """
+    Pack a single query profile into flat arrays for compute_distances().
+    Separated to keep find_neighbours() readable.
+    """
+    d   = profile.d
+    ci  = profile.cone_identity
+
+    q_axis      = np.zeros(d, dtype=np.float64)
+    q_ecc       = 1.0
+    q_opening   = np.zeros(max(dp1, 1), dtype=np.float64)
+    q_anti_coop = np.zeros(max(d * dp1, 1), dtype=np.float64)
+
+    if ci is not None and dp1 > 0:
+        q_axis[:] = ci.axis
+        q_ecc     = ci.eccentricity
+        n_ang = min(len(ci.opening_profile), dp1)
+        if n_ang > 0:
+            q_opening[:n_ang] = ci.opening_profile[:n_ang]
+        V     = ci.anti_cooperative_frame
+        n_col = min(V.shape[1], dp1)
+        if n_col > 0:
+            q_anti_coop[:d * n_col] = V[:, :n_col].ravel()
+
+    q_partition  = np.zeros(max(K, 1), dtype=np.float64)
+    q_transition = np.zeros(max(K * K, 1), dtype=np.float64)
+    q_has_part   = 0
+    q_has_trans  = 0
+
+    if profile.partition_profile is not None and K > 0:
+        kp = min(len(profile.partition_profile), K)
+        q_partition[:kp] = profile.partition_profile[:kp]
+        q_has_part = 1
+
+    if profile.transition_matrix is not None and K > 0:
+        km = min(profile.transition_matrix.shape[0], K)
+        q_transition[:km * km] = profile.transition_matrix[:km, :km].ravel()
+        q_has_trans = 1
+
+    return dict(
+        axis       = np.ascontiguousarray(q_axis),
+        ecc        = float(q_ecc),
+        opening    = np.ascontiguousarray(q_opening[:dp1]   if dp1 > 0 else q_opening[:0]),
+        anti_coop  = np.ascontiguousarray(q_anti_coop[:d*dp1] if dp1 > 0 else q_anti_coop[:0]),
+        mu         = np.ascontiguousarray(profile.mu, dtype=np.float64),
+        coop_dir   = np.ascontiguousarray(profile.cooperative_direction, dtype=np.float64),
+        partition  = np.ascontiguousarray(q_partition[:K]   if K > 0 else q_partition[:0]),
+        transition = np.ascontiguousarray(q_transition[:K*K] if K > 0 else q_transition[:0]),
+        geo_reliable  = int(profile.geometry_reliable),
+        has_partition = q_has_part,
+        has_transition= q_has_trans,
+    )
+
+
 class ICGHVRTMatcher:
     """
-    Five-component distance for matching patients on their personal cooperative manifolds.
+    Eight-component cone distance for matching patients on their personal
+    cooperative cones (ICG-HVRT v0.2.0).
 
-    Parameters
-    ----------
-    alpha_levels : weight for Euclidean mean distance (d_mu)
-    alpha_direction : weight for cooperative direction alignment (d_w)
-    alpha_shape : weight for Log-Euclidean manifold curvature (d_sigma)
-    alpha_occupation : weight for Wasserstein occupation distance (d_occ)
-    alpha_dynamics : weight for Frobenius transition-matrix distance (d_dyn)
-    direction_gate : angular threshold (radians) for the cooperative direction gate.
-                     When d_w exceeds this threshold the match is flagged as
-                     geometrically unsafe.  Default pi/4 (~45 degrees).
-    auto_calibrate : if True, call calibrate() before each find_neighbours()
-                     unless already calibrated.
-    cascade : if True, use the hierarchical three-level cascade (spec §5.2) instead
-              of exhaustive weighted-sum search.  Default False.
-    cascade_k2 : number of Level-2 (shape-match) candidates to carry into Level 3.
-                 None = auto (3*k, capped at the Level-1 survivor count).
+    Identity weights (beta_*) — cone family compatibility
+    -------------------------------------------------------
+    beta_axis         : weight for cooperative axis alignment (d_axis)
+    beta_opening      : weight for directional half-angle profile (d_opening)
+    beta_eccentricity : weight for cone eccentricity difference (d_ecc)
+    beta_orientation  : weight for anti-cooperative frame orientation (d_orient)
+
+    State weights (gamma_*) — cooperative state
+    --------------------------------------------
+    gamma_levels      : weight for cooperative mean distance d_mu_coop
+    gamma_levels_perp : weight for perpendicular mean distance d_mu_perp
+    gamma_occupation  : weight for Wasserstein occupation distance (d_occ)
+    gamma_dynamics    : weight for Frobenius transition-matrix distance (d_dyn)
+
+    auto_calibrate : if True, call calibrate() on first find_neighbours() call
     """
 
     def __init__(
         self,
-        alpha_levels: float = 1.0,
-        alpha_direction: float = 2.0,
-        alpha_shape: float = 1.0,
-        alpha_occupation: float = 1.5,
-        alpha_dynamics: float = 1.0,
-        direction_gate: float = np.pi / 4,
+        beta_axis: float = 3.0,
+        beta_opening: float = 2.0,
+        beta_eccentricity: float = 1.0,
+        beta_orientation: float = 1.5,
+        gamma_levels: float = 1.0,
+        gamma_levels_perp: float = 0.25,
+        gamma_occupation: float = 1.5,
+        gamma_dynamics: float = 1.0,
         auto_calibrate: bool = True,
-        cascade: bool = False,
-        cascade_k2: Optional[int] = None,
     ) -> None:
-        self.alpha_levels = alpha_levels
-        self.alpha_direction = alpha_direction
-        self.alpha_shape = alpha_shape
-        self.alpha_occupation = alpha_occupation
-        self.alpha_dynamics = alpha_dynamics
-        self.direction_gate = direction_gate
+        self.beta_axis = beta_axis
+        self.beta_opening = beta_opening
+        self.beta_eccentricity = beta_eccentricity
+        self.beta_orientation = beta_orientation
+        self.gamma_levels = gamma_levels
+        self.gamma_levels_perp = gamma_levels_perp
+        self.gamma_occupation = gamma_occupation
+        self.gamma_dynamics = gamma_dynamics
         self.auto_calibrate = auto_calibrate
-        self.cascade = cascade
-        self.cascade_k2 = cascade_k2
 
         # Internal calibration scales (set by calibrate())
+        self._scale_axis: float = 1.0
+        self._scale_opening: float = 1.0
+        self._scale_eccentricity: float = 1.0
+        self._scale_orientation: float = 1.0
         self._scale_levels: float = 1.0
-        self._scale_direction: float = 1.0
-        self._scale_shape: float = 1.0
+        self._scale_levels_perp: float = 1.0
         self._scale_occ: float = 1.0
         self._scale_dyn: float = 1.0
         self._calibrated: bool = False
-
-        # Populated by find_neighbours() when cascade=True
-        self.last_cascade_info: Dict = {}
+        # Packed training profile arrays for C++ kernels (set by calibrate())
+        self._tr_packed: Optional[dict] = None
 
     # ------------------------------------------------------------------ #
     # Calibration                                                          #
@@ -90,13 +259,14 @@ class ICGHVRTMatcher:
 
     def calibrate(self, profiles: List[CooperativeGeometryProfile]) -> None:
         """
-        Estimate per-component standard deviations across a reference profile set
-        and update internal scales so each component contributes proportionally
-        to its discriminative power.
+        Estimate per-component standard deviations across a reference profile
+        set and update internal scales so each component contributes in
+        proportion to its empirical discriminative power.
 
-        alpha_k_effective = alpha_k / scale_k
+        effective_weight_k = weight_k / scale_k
 
         where scale_k = std(component_k across calibration pairs).
+        Minimum floors prevent noise amplification on low-variation components.
         """
         n = len(profiles)
         if n < 2:
@@ -105,44 +275,132 @@ class ICGHVRTMatcher:
 
         rng = np.random.default_rng(42)
         idx = rng.choice(n, min(n, 100), replace=False)
-        pairs = [(idx[k], idx[l]) for k in range(len(idx)) for l in range(k + 1, min(k + 8, len(idx)))]
+        pairs = [
+            (idx[k], idx[l])
+            for k in range(len(idx))
+            for l in range(k + 1, min(k + 8, len(idx)))
+        ]
 
-        lv, dw, ds, oc, dy = [], [], [], [], []
+        ax, op, ec, ori, lv_coop, lv_perp, oc, dy = [], [], [], [], [], [], [], []
+
         for i, j in pairs:
             pi, pj = profiles[i], profiles[j]
-            lv.append(euclidean_mean_distance(pi.mu, pj.mu))
-            dw.append(cooperative_direction_distance(pi.cooperative_direction, pj.cooperative_direction))
-            ds.append(log_euclidean_distance(pi.sigma, pj.sigma))
+
+            # Identity components from ConeIdentity
+            if pi.cone_identity is not None and pj.cone_identity is not None:
+                id_dist = ConeIdentity.distance(pi.cone_identity, pj.cone_identity)
+                ax.append(id_dist["axis"])
+                op.append(id_dist["opening"])
+                ec.append(id_dist["eccentricity"])
+                ori.append(id_dist["orientation"])
+
+            # State: mean decomposition
+            d_coop, d_perp = cooperative_mean_distance(
+                pi.mu, pj.mu, pi.cooperative_direction, pj.cooperative_direction
+            )
+            lv_coop.append(d_coop)
+            lv_perp.append(d_perp)
+
+            # State: longitudinal
             if pi.partition_profile is not None and pj.partition_profile is not None:
                 K = min(len(pi.partition_profile), len(pj.partition_profile))
-                oc.append(occupation_distance(pi.partition_profile[:K], pj.partition_profile[:K]))
+                oc.append(occupation_distance(
+                    pi.partition_profile[:K], pj.partition_profile[:K]
+                ))
                 dy.append(dynamics_distance(pi.transition_matrix, pj.transition_matrix))
 
         # Minimum "natural" scales prevent amplification of near-zero noise
-        # (e.g., d_sigma ≈ 0 for patients with identical covariance structure
-        # should not dominate d_mu when all Sigmas are nearly equal).
         _min = {
-            "levels":    0.20,       # minimum meaningful Euclidean mean distance
-            "direction": np.pi / 8,  # ~22 degrees
-            "shape":     0.30,       # minimum meaningful log-Euclidean distance
-            "occ":       0.05,       # minimum meaningful W1 occupation distance
-            "dyn":       0.10,       # minimum meaningful Frobenius dynamics distance
+            "axis":        np.pi / 12,  # ~15 degrees minimum meaningful axis difference
+            "opening":     0.05,        # minimum meaningful opening profile difference
+            "eccentricity": 0.10,       # minimum meaningful log-eccentricity difference
+            "orientation": 0.20,        # minimum meaningful Procrustes frame distance
+            "levels_coop": 0.15,
+            "levels_perp": 0.15,
+            "occ":         0.05,
+            "dyn":         0.10,
         }
 
         def _safe_std(lst: list, key: str) -> float:
             s = float(np.std(lst)) if lst else 0.0
             return max(s, _min[key])
 
-        self._scale_levels    = _safe_std(lv, "levels")
-        self._scale_direction = _safe_std(dw, "direction")
-        self._scale_shape     = _safe_std(ds, "shape")
-        self._scale_occ       = _safe_std(oc, "occ")
-        self._scale_dyn       = _safe_std(dy, "dyn")
+        self._scale_axis        = _safe_std(ax,      "axis")
+        self._scale_opening     = _safe_std(op,      "opening")
+        self._scale_eccentricity = _safe_std(ec,     "eccentricity")
+        self._scale_orientation = _safe_std(ori,     "orientation")
+        self._scale_levels      = _safe_std(lv_coop, "levels_coop")
+        self._scale_levels_perp = _safe_std(lv_perp, "levels_perp")
+        self._scale_occ         = _safe_std(oc,      "occ")
+        self._scale_dyn         = _safe_std(dy,      "dyn")
         self._calibrated = True
+
+        # Pack training profiles for C++ kernels (zero cost when _core absent).
+        if _HAS_CPP:
+            self._tr_packed = _pack_profiles(profiles)
 
     # ------------------------------------------------------------------ #
     # Distance computation                                                 #
     # ------------------------------------------------------------------ #
+
+    def _raw_components(
+        self,
+        p_i: CooperativeGeometryProfile,
+        p_j: CooperativeGeometryProfile,
+    ) -> Dict[str, float]:
+        """
+        Return the 8 raw (unscaled, unweighted) component values plus a
+        ``geo_reliable`` flag.
+
+        Identity components are zeroed when geometry is unreliable (mirrors
+        the masking in distance_components).  Used by fit_weights() to
+        pre-compute the full component matrix once and reweight cheaply.
+
+        Key order matches the COMP_ORDER constant in fit_weights():
+          axis, opening, eccentricity, orientation,
+          levels, levels_perp, occupation, dynamics
+        """
+        geo_reliable = p_i.geometry_reliable and p_j.geometry_reliable
+
+        # Identity components (zeroed when geometry unreliable)
+        axis = opening = eccentricity = orientation = 0.0
+        if (geo_reliable
+                and p_i.cone_identity is not None
+                and p_j.cone_identity is not None):
+            id_dist = ConeIdentity.distance(p_i.cone_identity, p_j.cone_identity)
+            axis        = id_dist["axis"]
+            opening     = id_dist["opening"]
+            eccentricity = id_dist["eccentricity"]
+            orientation  = id_dist["orientation"]
+
+        # State: mean decomposition (levels_perp zeroed when geo unreliable)
+        d_coop, d_perp = cooperative_mean_distance(
+            p_i.mu, p_j.mu, p_i.cooperative_direction, p_j.cooperative_direction
+        )
+        if not geo_reliable:
+            d_perp = 0.0
+
+        # State: longitudinal
+        occ = 0.0
+        if p_i.partition_profile is not None and p_j.partition_profile is not None:
+            K = min(len(p_i.partition_profile), len(p_j.partition_profile))
+            occ = occupation_distance(p_i.partition_profile[:K], p_j.partition_profile[:K])
+
+        dyn = 0.0
+        if p_i.transition_matrix is not None and p_j.transition_matrix is not None:
+            dyn = dynamics_distance(p_i.transition_matrix, p_j.transition_matrix)
+
+        return {
+            "axis":         float(axis),
+            "opening":      float(opening),
+            "eccentricity": float(eccentricity),
+            "orientation":  float(orientation),
+            "levels":       float(d_coop),
+            "levels_perp":  float(d_perp),
+            "occupation":   float(occ),
+            "dynamics":     float(dyn),
+            "geo_reliable": geo_reliable,
+        }
 
     def distance_components(
         self,
@@ -150,51 +408,49 @@ class ICGHVRTMatcher:
         p_j: CooperativeGeometryProfile,
     ) -> Dict[str, float]:
         """
-        Compute all five distance components between two profiles.
+        Compute all eight distance components between two profiles.
 
         Returns a dict with keys:
-          'levels', 'direction', 'shape', 'occupation', 'dynamics',
-          'total', 'direction_gate_passed'.
+          'axis', 'opening', 'eccentricity', 'orientation'  -- identity
+          'levels', 'levels_perp', 'occupation', 'dynamics' -- state
+          'identity_distance'  -- sum of weighted identity components
+          'total'              -- sum of all weighted components
+          'geometry_reliable'  -- True when covariance geometry is trustworthy
+
+        The 'identity_distance' key exposes how geometrically incompatible
+        the two cones are, independent of their states.  Use it as an
+        uncertainty signal: when the k-NN set has high average identity_distance,
+        the prediction relies on structurally mismatched neighbours.
         """
-        # Normalised raw components
-        d_mu = euclidean_mean_distance(p_i.mu, p_j.mu) / self._scale_levels
-        d_w_raw = cooperative_direction_distance(
-            p_i.cooperative_direction, p_j.cooperative_direction
-        )
-        d_w = d_w_raw / self._scale_direction
-        d_sigma = log_euclidean_distance(p_i.sigma, p_j.sigma) / self._scale_shape
+        raw = self._raw_components(p_i, p_j)
+        geo_reliable = raw["geo_reliable"]
 
-        gate_passed = d_w_raw <= self.direction_gate
+        d_axis_w    = self.beta_axis         * raw["axis"]         / self._scale_axis
+        d_opening_w = self.beta_opening      * raw["opening"]      / self._scale_opening
+        d_ecc_w     = self.beta_eccentricity * raw["eccentricity"] / self._scale_eccentricity
+        d_orient_w  = self.beta_orientation  * raw["orientation"]  / self._scale_orientation
 
-        d_occ = 0.0
-        if p_i.partition_profile is not None and p_j.partition_profile is not None:
-            K = min(len(p_i.partition_profile), len(p_j.partition_profile))
-            d_occ = occupation_distance(
-                p_i.partition_profile[:K], p_j.partition_profile[:K]
-            ) / self._scale_occ
+        identity_dist = d_axis_w + d_opening_w + d_ecc_w + d_orient_w
 
-        d_dyn = 0.0
-        if p_i.transition_matrix is not None and p_j.transition_matrix is not None:
-            d_dyn = dynamics_distance(
-                p_i.transition_matrix, p_j.transition_matrix
-            ) / self._scale_dyn
+        d_mu_coop_w = self.gamma_levels      * raw["levels"]      / self._scale_levels
+        d_mu_perp_w = self.gamma_levels_perp * raw["levels_perp"] / self._scale_levels_perp
+        d_occ_w     = self.gamma_occupation  * raw["occupation"]  / self._scale_occ
+        d_dyn_w     = self.gamma_dynamics    * raw["dynamics"]    / self._scale_dyn
 
-        total = (
-            self.alpha_levels * d_mu
-            + self.alpha_direction * d_w
-            + self.alpha_shape * d_sigma
-            + self.alpha_occupation * d_occ
-            + self.alpha_dynamics * d_dyn
-        )
+        total = identity_dist + d_mu_coop_w + d_mu_perp_w + d_occ_w + d_dyn_w
 
         return {
-            "levels": float(self.alpha_levels * d_mu),
-            "direction": float(self.alpha_direction * d_w),
-            "shape": float(self.alpha_shape * d_sigma),
-            "occupation": float(self.alpha_occupation * d_occ),
-            "dynamics": float(self.alpha_dynamics * d_dyn),
-            "total": float(total),
-            "direction_gate_passed": gate_passed,
+            "axis":              float(d_axis_w),
+            "opening":           float(d_opening_w),
+            "eccentricity":      float(d_ecc_w),
+            "orientation":       float(d_orient_w),
+            "levels":            float(d_mu_coop_w),
+            "levels_perp":       float(d_mu_perp_w),
+            "occupation":        float(d_occ_w),
+            "dynamics":          float(d_dyn_w),
+            "identity_distance": float(identity_dist),
+            "total":             float(total),
+            "geometry_reliable": geo_reliable,
         }
 
     def distance(
@@ -202,8 +458,181 @@ class ICGHVRTMatcher:
         p_i: CooperativeGeometryProfile,
         p_j: CooperativeGeometryProfile,
     ) -> float:
-        """Scalar five-component distance between two profiles."""
+        """Scalar total distance between two profiles."""
         return self.distance_components(p_i, p_j)["total"]
+
+    # ------------------------------------------------------------------ #
+    # Weight learning                                                      #
+    # ------------------------------------------------------------------ #
+
+    def fit_weights(
+        self,
+        profiles: List[CooperativeGeometryProfile],
+        obs_list: List[np.ndarray],
+        T_list: List[np.ndarray],
+        Y_list: List[np.ndarray],
+        k: int = 10,
+        alpha_local: float = 1.0,
+        max_iter: int = 200,
+        n_eval_patients: int = 80,
+    ) -> None:
+        """
+        Learn beta/gamma multipliers from training data using LOO Y-prediction
+        error as a fully self-supervised proxy (no ITE labels required).
+
+        Principle: good weights → geometrically consistent neighbours →
+        local Ridge predicts Y accurately → low LOO MSE.
+
+        Optimises in log-space (exp enforces positivity) with Nelder-Mead.
+        Updates self.beta_* and self.gamma_* in-place.
+
+        Parameters
+        ----------
+        profiles      : training profiles (same list passed to calibrate)
+        obs_list      : per-patient (N_i, d) feature observation matrices
+        T_list        : per-patient (N_i, 1) treatment observation vectors
+        Y_list        : per-patient (N_i,) outcome vectors
+        k             : neighbourhood size for LOO proxy (default 10)
+        alpha_local   : Ridge regularisation for local models
+        max_iter      : Nelder-Mead maximum iterations
+        n_eval_patients : number of patients sub-sampled for evaluation
+        """
+        from scipy.optimize import minimize
+        from sklearn.linear_model import Ridge
+
+        N = len(profiles)
+        n_eval = min(n_eval_patients, N)
+
+        rng = np.random.default_rng(42)
+        eval_idx = rng.choice(N, n_eval, replace=False)
+
+        # Component order (must match scales array below)
+        _COMP = [
+            "axis", "opening", "eccentricity", "orientation",
+            "levels", "levels_perp", "occupation", "dynamics",
+        ]
+
+        # Pre-compute (n_eval, N, 8) raw component cache.
+        # C++ path: single call replaces the O(n_eval * N) Python loop.
+        if _HAS_CPP and self._tr_packed is not None:
+            packed = self._tr_packed
+            eval_idx_i32 = np.asarray(eval_idx, dtype=np.int32)
+            raw_cache = _cpp.compute_raw_cache(
+                eval_idx_i32,
+                packed["axes"], packed["eccentricities"],
+                packed["openings"], packed["anti_coops"],
+                packed["mus"], packed["coop_dirs"],
+                packed["partitions"], packed["transitions"],
+                packed["geo_reliable"], packed["has_partition"],
+                packed["has_transition"],
+            )
+        else:
+            raw_cache = np.zeros((n_eval, N, 8))
+            for ei, i in enumerate(eval_idx):
+                for j in range(N):
+                    raw = self._raw_components(profiles[i], profiles[j])
+                    for c, key in enumerate(_COMP):
+                        raw_cache[ei, j, c] = raw[key]
+
+        scales = np.array([
+            self._scale_axis,
+            self._scale_opening,
+            self._scale_eccentricity,
+            self._scale_orientation,
+            self._scale_levels,
+            self._scale_levels_perp,
+            self._scale_occ,
+            self._scale_dyn,
+        ])
+
+        w0 = np.array([
+            self.beta_axis,
+            self.beta_opening,
+            self.beta_eccentricity,
+            self.beta_orientation,
+            self.gamma_levels,
+            self.gamma_levels_perp,
+            self.gamma_occupation,
+            self.gamma_dynamics,
+        ])
+        log_w0 = np.log(np.maximum(w0, 1e-6))
+
+        if _HAS_CPP:
+            # ── C++ fast path ─────────────────────────────────────────────
+            # Pre-stack all patient observations into flat contiguous arrays.
+            # Offsets[j] = start row of patient j; offsets[N] = total rows.
+            offsets = np.zeros(N + 1, dtype=np.int32)
+            for j in range(N):
+                offsets[j + 1] = offsets[j] + len(obs_list[j])
+            obs_flat = np.ascontiguousarray(
+                np.vstack(obs_list), dtype=np.float64)
+            T_flat = np.ascontiguousarray(
+                np.vstack(T_list).ravel(), dtype=np.float64)
+            Y_flat = np.ascontiguousarray(
+                np.hstack(Y_list), dtype=np.float64)
+            eval_idx_i32 = np.asarray(eval_idx, dtype=np.int32)
+            raw_cache_c  = np.ascontiguousarray(raw_cache, dtype=np.float64)
+            scales_c     = np.ascontiguousarray(scales,    dtype=np.float64)
+
+            def _objective(log_weights: np.ndarray) -> float:
+                weights_arr = np.ascontiguousarray(
+                    np.exp(log_weights), dtype=np.float64)
+                return _cpp.loo_objective(
+                    raw_cache_c, obs_flat, T_flat, Y_flat,
+                    offsets, eval_idx_i32,
+                    weights_arr, scales_c,
+                    k, alpha_local,
+                )
+        else:
+            # ── Pure-Python fallback ──────────────────────────────────────
+            def _objective(log_weights: np.ndarray) -> float:
+                weights = np.exp(log_weights)
+                eff_w = weights / scales
+
+                D_matrix = raw_cache @ eff_w
+
+                total_mse = 0.0
+                for ei, i in enumerate(eval_idx):
+                    D_i = D_matrix[ei].copy()
+                    D_i[i] = np.inf
+                    nn_idx = np.argsort(D_i)[:k]
+
+                    X_local = np.vstack([obs_list[j] for j in nn_idx])
+                    T_local = np.vstack([T_list[j] for j in nn_idx])
+                    Y_local = np.hstack([Y_list[j] for j in nn_idx])
+
+                    XT_local = np.hstack([X_local, T_local])
+                    model = Ridge(alpha=alpha_local)
+                    model.fit(XT_local, Y_local)
+
+                    XT_i = np.hstack([obs_list[i], T_list[i]])
+                    Y_hat_i = model.predict(XT_i)
+                    total_mse += float(np.mean((Y_list[i] - Y_hat_i) ** 2))
+
+                return total_mse / n_eval
+
+        # L-BFGS-B with numerical Jacobian: ~30 gradient steps × 9 FD evals
+        # instead of ~500 Nelder-Mead evaluations.  Weights are bounded to
+        # [0.001, 50] in original space → [-6.9, 3.9] in log-space.
+        bounds = [(-6.9, 3.9)] * 8
+        result = minimize(
+            _objective,
+            log_w0,
+            method="L-BFGS-B",
+            jac="2-point",
+            bounds=bounds,
+            options={"maxiter": max_iter, "ftol": 1e-7, "gtol": 1e-3},
+        )
+
+        learned = np.exp(result.x)
+        self.beta_axis         = float(learned[0])
+        self.beta_opening      = float(learned[1])
+        self.beta_eccentricity = float(learned[2])
+        self.beta_orientation  = float(learned[3])
+        self.gamma_levels      = float(learned[4])
+        self.gamma_levels_perp = float(learned[5])
+        self.gamma_occupation  = float(learned[6])
+        self.gamma_dynamics    = float(learned[7])
 
     # ------------------------------------------------------------------ #
     # Neighbour search                                                     #
@@ -217,7 +646,12 @@ class ICGHVRTMatcher:
         exclude_idx: Optional[int] = None,
     ) -> np.ndarray:
         """
-        Return the indices of the k nearest training profiles to the query.
+        Return the indices of the k nearest training profiles to the query,
+        ranked by the unified eight-component total distance.
+
+        No hard gate is applied.  Geometrically incompatible patients receive
+        higher identity_distance, inflating their total distance and pushing
+        them down the ranking — the geometry does the weighting implicitly.
 
         Parameters
         ----------
@@ -225,12 +659,6 @@ class ICGHVRTMatcher:
         training_profiles : list of training profiles
         k : number of nearest neighbours to return
         exclude_idx : index to skip (for leave-one-out cross-validation)
-
-        When cascade=True, self.last_cascade_info is populated with:
-          level1_size  -- candidates surviving the direction filter
-          level2_size  -- candidates surviving the shape match
-          level3_size  -- final neighbourhood size (= k unless fallback)
-          fallback     -- True if Level 1 was too thin and exhaustive was used
         """
         if self.auto_calibrate and not self._calibrated:
             self.calibrate(training_profiles)
@@ -238,134 +666,44 @@ class ICGHVRTMatcher:
         n = len(training_profiles)
         k_eff = min(k, n - (1 if exclude_idx is not None else 0))
 
-        if self.cascade:
-            return self._cascade_search(query_profile, training_profiles, k_eff, exclude_idx)
-        return self._exhaustive_search(query_profile, training_profiles, k_eff, exclude_idx)
+        # ── C++ fast path ─────────────────────────────────────────────────
+        if _HAS_CPP and self._tr_packed is not None:
+            packed = self._tr_packed
+            dp1    = packed["dp1"]
+            K      = packed["K"]
+            q      = _pack_query(query_profile, K, dp1)
+            weights = np.array([
+                self.beta_axis, self.beta_opening,
+                self.beta_eccentricity, self.beta_orientation,
+                self.gamma_levels, self.gamma_levels_perp,
+                self.gamma_occupation, self.gamma_dynamics,
+            ], dtype=np.float64)
+            scales = np.array([
+                self._scale_axis, self._scale_opening,
+                self._scale_eccentricity, self._scale_orientation,
+                self._scale_levels, self._scale_levels_perp,
+                self._scale_occ, self._scale_dyn,
+            ], dtype=np.float64)
+            dists = _cpp.compute_distances(
+                q["axis"], q["ecc"], q["opening"], q["anti_coop"],
+                q["mu"], q["coop_dir"], q["partition"], q["transition"],
+                q["geo_reliable"], q["has_partition"], q["has_transition"],
+                packed["axes"], packed["eccentricities"],
+                packed["openings"], packed["anti_coops"],
+                packed["mus"], packed["coop_dirs"],
+                packed["partitions"], packed["transitions"],
+                packed["geo_reliable"], packed["has_partition"],
+                packed["has_transition"],
+                weights, scales,
+            )
+            if exclude_idx is not None:
+                dists[exclude_idx] = np.inf
+            return np.argsort(dists)[:k_eff]
 
-    # ------------------------------------------------------------------ #
-    # Private search implementations                                       #
-    # ------------------------------------------------------------------ #
-
-    def _exhaustive_search(
-        self,
-        query_profile: CooperativeGeometryProfile,
-        training_profiles: List[CooperativeGeometryProfile],
-        k: int,
-        exclude_idx: Optional[int] = None,
-    ) -> np.ndarray:
-        """Weighted-sum search across all training patients."""
-        n = len(training_profiles)
+        # ── Pure-Python fallback ──────────────────────────────────────────
         dists = np.full(n, np.inf)
         for j, p_j in enumerate(training_profiles):
             if j == exclude_idx:
                 continue
             dists[j] = self.distance(query_profile, p_j)
-        return np.argsort(dists)[:k]
-
-    def _cascade_search(
-        self,
-        query_profile: CooperativeGeometryProfile,
-        training_profiles: List[CooperativeGeometryProfile],
-        k: int,
-        exclude_idx: Optional[int] = None,
-    ) -> np.ndarray:
-        """
-        Hierarchical three-level cascade (spec §5.2).
-
-        Level 1 — Cooperative Direction Filter
-            Retain j where d_w(i, j) < direction_gate.
-            O(n · d).
-
-        Level 2 — Manifold Shape Match
-            Among Level-1 survivors, keep the k2 nearest by d_sigma.
-            O(|L1| · d³).
-
-        Level 3 — Occupation + Dynamics Match
-            Among Level-2 survivors, keep the k nearest by
-            alpha_occupation*d_occ + alpha_dynamics*d_dyn.
-            Falls back to full weighted-sum within Level-2 when
-            neither partition profiles nor transition matrices are available.
-            O(|L2| · K²).
-        """
-        # ── Level 1: Cooperative Direction Filter ──────────────────── #
-        level1: List[int] = []
-        for j, p_j in enumerate(training_profiles):
-            if j == exclude_idx:
-                continue
-            d_w_raw = cooperative_direction_distance(
-                query_profile.cooperative_direction, p_j.cooperative_direction
-            )
-            if d_w_raw < self.direction_gate:
-                level1.append(j)
-
-        # Fallback when Level 1 is too thin to supply k neighbours
-        if len(level1) < k:
-            self.last_cascade_info = {
-                "level1_size": len(level1),
-                "level2_size": 0,
-                "level3_size": 0,
-                "fallback": True,
-            }
-            return self._exhaustive_search(query_profile, training_profiles, k, exclude_idx)
-
-        # ── Level 2: Manifold Shape Match ──────────────────────────── #
-        k2 = (
-            self.cascade_k2
-            if self.cascade_k2 is not None
-            else min(k * 3, len(level1))
-        )
-        k2 = min(k2, len(level1))
-
-        shape_dists = sorted(
-            (
-                (j, log_euclidean_distance(query_profile.sigma, training_profiles[j].sigma)
-                 / self._scale_shape)
-                for j in level1
-            ),
-            key=lambda x: x[1],
-        )
-        level2 = [j for j, _ in shape_dists[:k2]]
-
-        # ── Level 3: Occupation + Dynamics Match ───────────────────── #
-        dyn_dists = []
-        has_longitudinal = False
-        for j in level2:
-            p_j = training_profiles[j]
-            d_occ = 0.0
-            if query_profile.partition_profile is not None and p_j.partition_profile is not None:
-                K = min(len(query_profile.partition_profile), len(p_j.partition_profile))
-                d_occ = (
-                    occupation_distance(
-                        query_profile.partition_profile[:K], p_j.partition_profile[:K]
-                    )
-                    / self._scale_occ
-                )
-                has_longitudinal = True
-            d_dyn = 0.0
-            if query_profile.transition_matrix is not None and p_j.transition_matrix is not None:
-                d_dyn = (
-                    dynamics_distance(query_profile.transition_matrix, p_j.transition_matrix)
-                    / self._scale_dyn
-                )
-                has_longitudinal = True
-            dyn_dists.append((j, self.alpha_occupation * d_occ + self.alpha_dynamics * d_dyn))
-
-        # When occ+dyn provide no signal (static-only profiles), fall back to
-        # full weighted-sum distance within the Level-2 candidate set so Level 3
-        # still provides useful ranking rather than arbitrary ordering.
-        if not has_longitudinal:
-            dyn_dists = [
-                (j, self.distance(query_profile, training_profiles[j]))
-                for j in level2
-            ]
-
-        dyn_dists.sort(key=lambda x: x[1])
-        final_idx = np.array([j for j, _ in dyn_dists[:k]])
-
-        self.last_cascade_info = {
-            "level1_size": len(level1),
-            "level2_size": len(level2),
-            "level3_size": int(len(final_idx)),
-            "fallback": False,
-        }
-        return final_idx
+        return np.argsort(dists)[:k_eff]

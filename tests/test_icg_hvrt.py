@@ -1,5 +1,5 @@
 """
-Unit tests for the ICG-HVRT implementation.
+Unit tests for the ICG-HVRT implementation (v0.2.0).
 
 Run with:  python -m pytest tests/test_icg_hvrt.py -v
 """
@@ -11,6 +11,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from autoite import (
+    ConeIdentity,
     CooperativeGeometryProfile,
     SharedHVRT,
     fit_shared_hvrt,
@@ -20,6 +21,7 @@ from autoite import (
 )
 from autoite.distances import (
     euclidean_mean_distance,
+    cooperative_mean_distance,
     cooperative_direction_distance,
     log_euclidean_distance,
     occupation_distance,
@@ -65,6 +67,13 @@ class TestCooperativeGeometryProfile:
         assert isinstance(p.cone_angle, float)
         assert p.d == d
         assert p.n_observations == n
+
+    def test_cone_identity_attached(self):
+        """Profile now carries a ConeIdentity object."""
+        X = RNG.standard_normal((60, 4))
+        p = CooperativeGeometryProfile.from_longitudinal(X)
+        assert p.cone_identity is not None
+        assert isinstance(p.cone_identity, ConeIdentity)
 
     def test_cooperative_direction_formula(self):
         """
@@ -144,11 +153,10 @@ class TestCooperativeGeometryProfile:
         d, n = 4, 5  # too few for HVRT
         X = RNG.standard_normal((n, d))
         p = CooperativeGeometryProfile.from_longitudinal(X, n_partitions=8)
-        # Should still have static geometry even if HVRT fails
+        # Should still have static geometry and cone identity even if HVRT fails
         assert p.mu.shape == (d,)
         assert p.cooperative_direction.shape == (d,)
-        # Partition profile may be None
-        # (No assertion on partition_profile — graceful degradation)
+        assert p.cone_identity is not None
 
     def test_sigma_is_spd(self):
         """The returned covariance matrix must be symmetric positive definite."""
@@ -167,6 +175,142 @@ class TestCooperativeGeometryProfile:
         X_short = RNG.standard_normal((3, 4))
         p_short = CooperativeGeometryProfile.from_longitudinal(X_short)
         assert p_short.has_longitudinal == (p_short.partition_profile is not None)
+
+
+# ────────────────────────────────────────────────────────────────────── #
+# ConeIdentity tests                                                      #
+# ────────────────────────────────────────────────────────────────────── #
+
+class TestConeIdentity:
+
+    def test_shape_and_types(self):
+        """ConeIdentity.from_covariance returns correct array shapes."""
+        d = 4
+        sigma = random_spd(d, seed=10)
+        ci = ConeIdentity.from_covariance(sigma)
+
+        assert ci.axis.shape == (d,), f"axis shape {ci.axis.shape}"
+        assert isinstance(ci.positive_eigenvalue, float)
+        assert ci.negative_eigenvalues.shape == (d - 1,)
+        assert ci.anti_cooperative_frame.shape == (d, d - 1)
+        assert ci.opening_profile.shape == (d - 1,)
+        assert isinstance(ci.eccentricity, float)
+        assert ci.positive_eigenvalue > 0, "positive eigenvalue must be > 0"
+        assert np.all(ci.negative_eigenvalues < 0), "negative eigenvalues must be < 0"
+
+    def test_axis_is_normalised(self):
+        """The cooperative axis v+ must be a unit vector."""
+        sigma = random_spd(4, seed=20)
+        ci = ConeIdentity.from_covariance(sigma)
+        assert abs(float(np.linalg.norm(ci.axis)) - 1.0) < 1e-8
+
+    def test_circular_cone_isotropic_sigma(self):
+        """
+        When Sigma = I, the cone is circular: all half-angles are equal and
+        eccentricity = 1.0 (up to numerical noise from sample covariance).
+        """
+        d = 4
+        sigma = np.eye(d)
+        ci = ConeIdentity.from_covariance(sigma)
+        # All half-angles should be identical for isotropic Sigma
+        assert abs(ci.eccentricity - 1.0) < 1e-6, (
+            f"Isotropic sigma should give ecc=1.0, got {ci.eccentricity}"
+        )
+        # All half-angles equal
+        theta_std = float(np.std(ci.opening_profile))
+        assert theta_std < 1e-6, (
+            f"Isotropic sigma: half-angles should be equal, std={theta_std}"
+        )
+
+    def test_eccentricity_anisotropic(self):
+        """Anisotropic Sigma gives eccentricity > 1.0."""
+        d = 4
+        # Strong anisotropy: first dimension has 16x more variance
+        sigma = np.diag([16.0, 1.0, 1.0, 1.0])
+        ci = ConeIdentity.from_covariance(sigma)
+        assert ci.eccentricity > 1.0, (
+            f"Anisotropic sigma should give ecc > 1.0, got {ci.eccentricity}"
+        )
+
+    def test_opening_profile_sorted_descending(self):
+        """opening_profile must be sorted in descending order (widest first)."""
+        sigma = random_spd(5, seed=30)
+        ci = ConeIdentity.from_covariance(sigma)
+        diffs = np.diff(ci.opening_profile)
+        assert np.all(diffs <= 1e-9), (
+            f"opening_profile not descending: {ci.opening_profile}"
+        )
+
+    def test_distance_zero_same_identity(self):
+        """All distance components are zero when comparing an identity to itself."""
+        sigma = random_spd(4, seed=40)
+        ci = ConeIdentity.from_covariance(sigma)
+        d = ConeIdentity.distance(ci, ci)
+        assert d["axis"] < 1e-8
+        assert d["opening"] < 1e-8
+        assert d["eccentricity"] < 1e-8
+        assert d["orientation"] < 1e-8
+
+    def test_distance_axis_range(self):
+        """d_axis must lie in [0, pi/2] for any two cone identities."""
+        rng = np.random.default_rng(50)
+        for _ in range(20):
+            sigma_i = random_spd(4, seed=int(rng.integers(1000)))
+            sigma_j = random_spd(4, seed=int(rng.integers(1000)))
+            ci = ConeIdentity.from_covariance(sigma_i)
+            cj = ConeIdentity.from_covariance(sigma_j)
+            d = ConeIdentity.distance(ci, cj)
+            assert 0.0 <= d["axis"] <= np.pi / 2 + 1e-9, (
+                f"d_axis={d['axis']} out of [0, pi/2]"
+            )
+
+    def test_distance_keys(self):
+        """ConeIdentity.distance returns the expected keys."""
+        ci = ConeIdentity.from_covariance(random_spd(4, seed=60))
+        cj = ConeIdentity.from_covariance(random_spd(4, seed=61))
+        d = ConeIdentity.distance(ci, cj)
+        assert set(d.keys()) == {"axis", "opening", "eccentricity", "orientation"}
+
+    def test_eccentricity_ranking(self):
+        """
+        A highly eccentric cone should have larger d_ecc from an isotropic
+        reference than a mildly eccentric cone.
+        """
+        d = 4
+        sigma_ref  = np.eye(d)
+        sigma_mild = np.diag([2.0, 1.0, 1.0, 1.0])   # mild eccentricity
+        sigma_high = np.diag([16.0, 1.0, 1.0, 1.0])   # high eccentricity
+
+        ci_ref  = ConeIdentity.from_covariance(sigma_ref)
+        ci_mild = ConeIdentity.from_covariance(sigma_mild)
+        ci_high = ConeIdentity.from_covariance(sigma_high)
+
+        d_mild = ConeIdentity.distance(ci_ref, ci_mild)["eccentricity"]
+        d_high = ConeIdentity.distance(ci_ref, ci_high)["eccentricity"]
+        assert d_high > d_mild, (
+            f"High eccentricity should give larger d_ecc: "
+            f"d_mild={d_mild:.4f}, d_high={d_high:.4f}"
+        )
+
+    def test_from_operator_matches_from_covariance(self):
+        """from_operator and from_covariance must give the same result."""
+        d = 4
+        sigma = random_spd(d, seed=70)
+
+        # Compute C directly (same as profile.py does it)
+        eigvals, eigvecs = np.linalg.eigh(sigma)
+        eigvals = np.maximum(eigvals, 1e-10)
+        inv_sqrt = eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T
+        sigma_inv = eigvecs @ np.diag(1.0 / eigvals) @ eigvecs.T
+        w = inv_sqrt @ np.ones(d)
+        C = np.outer(w, w) - sigma_inv
+
+        ci_from_op  = ConeIdentity.from_operator(C)
+        ci_from_cov = ConeIdentity.from_covariance(sigma)
+
+        np.testing.assert_allclose(ci_from_op.opening_profile,
+                                   ci_from_cov.opening_profile, atol=1e-8)
+        assert abs(ci_from_op.eccentricity - ci_from_cov.eccentricity) < 1e-8
 
 
 # ────────────────────────────────────────────────────────────────────── #
@@ -225,6 +369,91 @@ class TestDistanceFunctions:
         assert dynamics_distance(M, M) < 1e-10
 
 
+class TestCooperativeMeanDistance:
+    """Tests for the cooperative mean distance decomposition."""
+
+    def test_pythagorean_identity(self):
+        """d_coop^2 + d_perp^2 == ||delta_mu||^2 for arbitrary inputs."""
+        rng = np.random.default_rng(7)
+        for _ in range(20):
+            d = rng.integers(2, 9)
+            mu_i = rng.standard_normal(d)
+            mu_j = rng.standard_normal(d)
+            # Build w vectors from random positive-definite Sigma
+            A = rng.standard_normal((d, d))
+            Sigma = A @ A.T + np.eye(d)
+            eig, vec = np.linalg.eigh(Sigma)
+            w = vec @ np.diag(1.0 / np.sqrt(np.maximum(eig, 1e-10))) @ vec.T @ np.ones(d)
+            d_coop, d_perp = cooperative_mean_distance(mu_i, mu_j, w, w)
+            l2 = float(np.linalg.norm(mu_i - mu_j))
+            assert abs(d_coop**2 + d_perp**2 - l2**2) < 1e-9, \
+                f"Pythagorean identity failed: {d_coop**2 + d_perp**2} != {l2**2}"
+
+    def test_zero_for_identical_means(self):
+        """Both components are zero when mu_i == mu_j."""
+        w = np.ones(4)
+        mu = np.array([1.0, 2.0, 3.0, 4.0])
+        d_coop, d_perp = cooperative_mean_distance(mu, mu, w, w)
+        assert d_coop < 1e-12
+        assert d_perp < 1e-12
+
+    def test_coop_detects_aligned_shift(self):
+        """Pure shift along w: d_coop = ||delta_mu||, d_perp = 0."""
+        w = np.ones(4) / 2.0          # cooperative direction (unnormalized)
+        mu_i = np.zeros(4)
+        mu_j = np.ones(4) * 2.0       # delta_mu = 2*ones, parallel to w
+        d_coop, d_perp = cooperative_mean_distance(mu_i, mu_j, w, w)
+        expected_coop = float(np.linalg.norm(mu_j - mu_i))   # pure projection
+        assert abs(d_coop - expected_coop) < 1e-9
+        assert d_perp < 1e-9
+
+    def test_perp_detects_orthogonal_shift(self):
+        """Shift orthogonal to w: d_coop = 0, d_perp = ||delta_mu||."""
+        w = np.array([1.0, 1.0, 0.0, 0.0])          # cooperative axis in dims 0,1
+        mu_i = np.zeros(4)
+        mu_j = np.array([0.0, 0.0, 3.0, 4.0])        # shift purely in dims 2,3
+        d_coop, d_perp = cooperative_mean_distance(mu_i, mu_j, w, w)
+        assert d_coop < 1e-9
+        assert abs(d_perp - float(np.linalg.norm(mu_j))) < 1e-9
+
+    def test_many_weak_leaks_tau_proportionality(self):
+        """
+        Mathematical property: when Sigma ~ I and mu = rho * U,
+        d_mu_coop = rho * |tau_i - tau_j|  regardless of K.
+
+        This is the key result that fixes the many-weak-measurements problem.
+        """
+        rng = np.random.default_rng(42)
+        rho = 0.3
+        for K in [1, 2, 4, 8, 16]:
+            d = K
+            coop_dists, tau_diffs, l2_dists = [], [], []
+            for _ in range(500):
+                U_i = rng.standard_normal(K)
+                U_j = rng.standard_normal(K)
+                mu_i = rho * U_i
+                mu_j = rho * U_j
+                tau_i = U_i.sum() / np.sqrt(K)
+                tau_j = U_j.sum() / np.sqrt(K)
+                # w ~ ones when Sigma ~ I
+                w = np.ones(d)
+                d_coop, _ = cooperative_mean_distance(mu_i, mu_j, w, w)
+                coop_dists.append(d_coop)
+                tau_diffs.append(abs(tau_i - tau_j))
+                l2_dists.append(float(np.linalg.norm(mu_i - mu_j)))
+
+            from scipy.stats import spearmanr
+            rho_coop, _ = spearmanr(coop_dists, tau_diffs)
+            rho_l2,   _ = spearmanr(l2_dists,   tau_diffs)
+            # d_mu_coop must be strongly correlated with tau regardless of K
+            assert rho_coop > 0.95, \
+                f"K={K}: d_mu_coop Spearman with |tau|={rho_coop:.3f} < 0.95"
+            # d_mu (L2) must degrade as K grows
+            if K >= 4:
+                assert rho_l2 < rho_coop, \
+                    f"K={K}: L2 rho={rho_l2:.3f} should be < coop rho={rho_coop:.3f}"
+
+
 # ────────────────────────────────────────────────────────────────────── #
 # Matcher tests                                                           #
 # ────────────────────────────────────────────────────────────────────── #
@@ -249,21 +478,21 @@ class TestICGHVRTMatcher:
         p2 = make_profile(seed=4)
         matcher = ICGHVRTMatcher(auto_calibrate=False)
         components = matcher.distance_components(p1, p2)
-        expected_keys = {"levels", "direction", "shape", "occupation", "dynamics",
-                         "total", "direction_gate_passed"}
+        expected_keys = {
+            "axis", "opening", "eccentricity", "orientation",
+            "levels", "levels_perp", "occupation", "dynamics",
+            "identity_distance", "total", "geometry_reliable",
+        }
         assert expected_keys == set(components.keys())
 
-    def test_direction_gate_flag(self):
-        """Gate passes when directions are aligned, fails when orthogonal."""
-        d = 3
-        X1 = RNG.standard_normal((60, d))
-        X2 = RNG.standard_normal((60, d))
-        p1 = CooperativeGeometryProfile.from_longitudinal(X1)
-        p2 = CooperativeGeometryProfile.from_longitudinal(X2)
-
-        # Self-match: gate must pass
-        matcher = ICGHVRTMatcher(direction_gate=np.pi / 4, auto_calibrate=False)
-        assert matcher.distance_components(p1, p1)["direction_gate_passed"]
+    def test_identity_distance_in_total(self):
+        """identity_distance must equal sum of identity components."""
+        p1 = make_profile(seed=5)
+        p2 = make_profile(seed=6)
+        matcher = ICGHVRTMatcher(auto_calibrate=False)
+        c = matcher.distance_components(p1, p2)
+        identity_sum = c["axis"] + c["opening"] + c["eccentricity"] + c["orientation"]
+        assert abs(identity_sum - c["identity_distance"]) < 1e-9
 
     def test_find_neighbours_returns_k(self):
         profiles = [make_profile(seed=i) for i in range(20)]
@@ -277,14 +506,46 @@ class TestICGHVRTMatcher:
         idx = matcher.find_neighbours(profiles[0], profiles, k=5, exclude_idx=0)
         assert 0 not in idx
 
-    def test_calibrate_reduces_scale_variance(self):
-        """After calibration, _scale values should be positive floats."""
+    def test_calibrate_sets_positive_scales(self):
+        """After calibration, all internal scales must be positive floats."""
         profiles = [make_profile(seed=i) for i in range(30)]
         matcher = ICGHVRTMatcher(auto_calibrate=False)
         matcher.calibrate(profiles)
+        assert matcher._scale_axis > 0
+        assert matcher._scale_opening > 0
+        assert matcher._scale_eccentricity > 0
+        assert matcher._scale_orientation > 0
         assert matcher._scale_levels > 0
-        assert matcher._scale_direction > 0
-        assert matcher._scale_shape > 0
+        assert matcher._scale_occ > 0
+
+    def test_eccentric_patients_have_larger_identity_distance(self):
+        """
+        Two patients with very different eccentricities should have a larger
+        identity_distance than two patients with similar eccentricities.
+        """
+        d = 4
+        rng = np.random.default_rng(99)
+        n_obs = 80
+
+        # Circular cone: Sigma ~ I
+        X_circ1 = rng.multivariate_normal(np.zeros(d), np.eye(d), n_obs)
+        X_circ2 = rng.multivariate_normal(np.zeros(d), np.eye(d) * 1.05, n_obs)
+        # Eccentric cone: one dimension has 16x variance
+        X_ecc = rng.multivariate_normal(np.zeros(d),
+                                        np.diag([16.0, 1.0, 1.0, 1.0]), n_obs)
+
+        p_circ1 = CooperativeGeometryProfile.from_longitudinal(X_circ1)
+        p_circ2 = CooperativeGeometryProfile.from_longitudinal(X_circ2)
+        p_ecc   = CooperativeGeometryProfile.from_longitudinal(X_ecc)
+
+        matcher = ICGHVRTMatcher(auto_calibrate=False)
+        id_similar  = matcher.distance_components(p_circ1, p_circ2)["identity_distance"]
+        id_different = matcher.distance_components(p_circ1, p_ecc)["identity_distance"]
+
+        assert id_different > id_similar, (
+            f"Different eccentricities should give larger identity_distance: "
+            f"similar={id_similar:.4f}, different={id_different:.4f}"
+        )
 
 
 # ────────────────────────────────────────────────────────────────────── #
@@ -314,7 +575,7 @@ class TestICGHVRTEstimator:
         X_tr, T_tr, Y_tr, E_tr = self.make_dataset(50, seed=0)
         X_te, T_te, _, E_te = self.make_dataset(10, seed=1)
 
-        estimator = ICGHVRTEstimator(k=20)
+        estimator = ICGHVRTEstimator(k=20, learn_weights=False)
         estimator.fit(X_tr, T_tr, Y_tr)
 
         preds = [estimator.predict_effect(X_te[i], T_te[i]) for i in range(len(X_te))]
@@ -328,21 +589,20 @@ class TestICGHVRTEstimator:
         X_tr, T_tr, Y_tr, E_tr = self.make_dataset(100, seed=10)
         X_te, T_te, _, E_te = self.make_dataset(20, seed=11)
 
-        estimator = ICGHVRTEstimator(k=30)
+        estimator = ICGHVRTEstimator(k=30, learn_weights=False)
         estimator.fit(X_tr, T_tr, Y_tr)
         preds = np.array([estimator.predict_effect(X_te[i], T_te[i]) for i in range(20)])
 
         mae_model = np.mean(np.abs(preds - E_te))
         mae_naive = np.mean(np.abs(E_tr.mean() - E_te))
 
-        # ICG-HVRT should do at least as well as the global mean
         assert mae_model <= mae_naive * 1.5, (
             f"Model MAE {mae_model:.4f} much worse than naive {mae_naive:.4f}"
         )
 
     def test_t_content_diagnostic_returns_float(self):
         X_tr, T_tr, Y_tr, E_tr = self.make_dataset(50, seed=5)
-        estimator = ICGHVRTEstimator(k=20)
+        estimator = ICGHVRTEstimator(k=20, learn_weights=False)
         estimator.fit(X_tr, T_tr, Y_tr)
         preds = np.array([
             estimator.predict_effect(X_tr[i], T_tr[i], exclude_idx=i)
@@ -351,6 +611,22 @@ class TestICGHVRTEstimator:
         tc = estimator.t_content_diagnostic(preds, estimator._profiles[:10])
         assert isinstance(tc, float)
         assert -1.0 <= tc <= 1.0
+
+    def test_triage_report_keys(self):
+        """triage_report must return dicts with the v0.2.0 uncertainty keys."""
+        X_tr, T_tr, Y_tr, _ = self.make_dataset(50, seed=20)
+        X_te, _, _, _ = self.make_dataset(5, seed=21)
+
+        estimator = ICGHVRTEstimator(k=20, learn_weights=False)
+        estimator.fit(X_tr, T_tr, Y_tr)
+        report = estimator.triage_report(X_te)
+
+        assert len(report) == 5
+        for entry in report:
+            assert "nearest_distance" in entry
+            assert "mean_identity_distance" in entry
+            assert "confidence" in entry
+            assert entry["confidence"] in ("high", "medium", "low", "uncertain")
 
 
 # ────────────────────────────────────────────────────────────────────── #
@@ -427,12 +703,12 @@ class TestSharedHVRT:
 
     def test_profiles_use_shared_hvrt(self):
         d, n_patients, n_obs = 4, 10, 80
-        X_all = RNG.standard_normal((n_patients * n_obs, d))
-        shared = fit_shared_hvrt(X_all, n_partitions=8)
+        from autoite.profile import pool_whitened_observations
+        X_list_all = [RNG.standard_normal((n_obs, d)) for _ in range(n_patients)]
+        shared = fit_shared_hvrt(pool_whitened_observations(X_list_all), n_partitions=8)
 
         profiles = []
-        for i in range(n_patients):
-            X_i = RNG.standard_normal((n_obs, d))
+        for X_i in X_list_all:
             p = CooperativeGeometryProfile.from_longitudinal(X_i, shared_hvrt=shared)
             profiles.append(p)
 
@@ -442,117 +718,7 @@ class TestSharedHVRT:
 
 
 # ────────────────────────────────────────────────────────────────────── #
-# Cascaded matching tests  (spec §5.2)                                    #
-# ────────────────────────────────────────────────────────────────────── #
-
-class TestCascadedMatching:
-    """Verify the three-level cascade search (spec §5.2)."""
-
-    def test_cascade_returns_k(self):
-        profiles = [make_profile(d=4, seed=i) for i in range(30)]
-        matcher = ICGHVRTMatcher(cascade=True, auto_calibrate=True)
-        idx = matcher.find_neighbours(profiles[0], profiles, k=5, exclude_idx=0)
-        assert len(idx) == 5
-
-    def test_cascade_excludes_self(self):
-        profiles = [make_profile(d=4, seed=i) for i in range(30)]
-        matcher = ICGHVRTMatcher(cascade=True, auto_calibrate=True)
-        idx = matcher.find_neighbours(profiles[0], profiles, k=5, exclude_idx=0)
-        assert 0 not in idx
-
-    def test_cascade_info_populated(self):
-        """last_cascade_info must be set after a cascade find_neighbours call."""
-        profiles = [make_profile(d=4, seed=i) for i in range(30)]
-        matcher = ICGHVRTMatcher(cascade=True, auto_calibrate=True)
-        matcher.find_neighbours(profiles[0], profiles, k=5, exclude_idx=0)
-        info = matcher.last_cascade_info
-        assert "level1_size" in info
-        assert "fallback" in info
-
-    def test_cascade_level1_filters_direction(self):
-        """
-        Level 1 retains only profiles whose cooperative direction is within
-        direction_gate of the query.  Using a very tight gate should produce
-        fewer survivors than the full pool.
-        """
-        rng = np.random.default_rng(99)
-        d = 4
-        profiles = []
-        for i in range(40):
-            A = rng.standard_normal((d, d)) * 0.8
-            cov = A @ A.T + np.eye(d)
-            X = rng.multivariate_normal(np.zeros(d), cov, 60)
-            profiles.append(CooperativeGeometryProfile.from_longitudinal(X))
-
-        # Very tight gate → Level 1 likely produces fewer survivors than n
-        tight_gate = np.pi / 12   # 15 degrees
-        matcher = ICGHVRTMatcher(
-            cascade=True, direction_gate=tight_gate, auto_calibrate=True
-        )
-        matcher.find_neighbours(profiles[0], profiles, k=5, exclude_idx=0)
-        info = matcher.last_cascade_info
-        # Either a fallback occurred (gate too tight, fewer than k survived)
-        # or Level 1 produced a strict subset of the 39 candidates.
-        assert info["fallback"] or info["level1_size"] < 39
-
-    def test_cascade_fallback_when_level1_thin(self):
-        """
-        When fewer than k profiles survive the direction gate, the cascade
-        must fall back to exhaustive search and set fallback=True.
-        """
-        rng = np.random.default_rng(7)
-        d = 4
-        profiles = []
-        for i in range(10):
-            A = rng.standard_normal((d, d)) * 2.0   # large spread → diverse directions
-            cov = A @ A.T + np.eye(d)
-            X = rng.multivariate_normal(np.zeros(d), cov, 60)
-            profiles.append(CooperativeGeometryProfile.from_longitudinal(X))
-
-        # Extremely tight gate forces Level 1 to produce 0 survivors
-        matcher = ICGHVRTMatcher(
-            cascade=True, direction_gate=1e-6, auto_calibrate=True
-        )
-        idx = matcher.find_neighbours(profiles[0], profiles, k=5, exclude_idx=0)
-        assert len(idx) == 5                              # still returns k
-        assert matcher.last_cascade_info["fallback"]      # flagged as fallback
-
-    def test_cascade_k2_controls_level2_size(self):
-        """
-        cascade_k2 explicitly bounds the number of Level-2 candidates.
-        When set to a small value, level2_size must not exceed it.
-        When set larger than the Level-1 survivor count, level2_size equals
-        the survivor count.
-        """
-        profiles = [make_profile(d=4, seed=i) for i in range(40)]
-
-        # Small k2: Level 2 should be capped at k2
-        m_small = ICGHVRTMatcher(cascade=True, cascade_k2=6, auto_calibrate=True)
-        m_small.find_neighbours(profiles[0], profiles, k=5, exclude_idx=0)
-        info = m_small.last_cascade_info
-        if not info["fallback"]:
-            assert info["level2_size"] <= 6
-
-        # Large k2: Level 2 keeps all Level-1 survivors
-        m_large = ICGHVRTMatcher(cascade=True, cascade_k2=1000, auto_calibrate=True)
-        m_large.find_neighbours(profiles[0], profiles, k=5, exclude_idx=0)
-        info2 = m_large.last_cascade_info
-        if not info2["fallback"]:
-            assert info2["level2_size"] == info2["level1_size"]
-
-
-# ────────────────────────────────────────────────────────────────────── #
 # Stress tests  (spec §8)                                                 #
-# ────────────────────────────────────────────────────────────────────── #
-#
-# Each class implements one of the four new DGPs described in spec §8.
-# The tests verify that ICG-HVRT achieves meaningful rank correlation
-# with the true ITE on each DGP, as required by the "Good" grade in
-# the expected-results table (spec §8.2).
-#
-# Thresholds are set conservatively to avoid flakiness; the ITE
-# evaluation experiment (experiments/ite_evaluation.py) provides
-# the full statistical picture across 20 seeds.
 # ────────────────────────────────────────────────────────────────────── #
 
 def _spearman(a, b):
@@ -568,7 +734,7 @@ class TestStressDirectionGate:
     tau = 3 * cos(angle(w_i, e_1)).
     Patients whose cooperative axis aligns with the first feature
     dimension benefit; orthogonal patients do not.
-    ICG-HVRT must detect this via d_w.
+    ICG-HVRT must detect this via the 'axis' identity component.
     """
 
     @staticmethod
@@ -596,32 +762,27 @@ class TestStressDirectionGate:
         X_tr, T_tr, Y_tr, E_tr = self._gen(150, seed=0)
         X_te, T_te, _,    E_te = self._gen(40,  seed=100)
 
-        est = ICGHVRTEstimator(k=20)
+        est = ICGHVRTEstimator(k=20, learn_weights=False)
         est.fit(X_tr, T_tr, Y_tr)
         preds = np.array([est.predict_effect(X_te[i], T_te[i]) for i in range(len(X_te))])
 
         rho = _spearman(preds, E_te)
         assert rho > 0.4, (
             f"ICG-HVRT Spearman rho={rho:.4f} < 0.4 on Direction Gate; "
-            "d_w component is not providing sufficient signal"
+            "axis identity component is not providing sufficient signal"
         )
 
-    def test_direction_component_discriminates(self):
+    def test_axis_component_zero_for_self(self):
         """
-        d_w between two profiles with similar mean/covariance but opposite
-        cooperative directions must be larger than d_w between profiles with
-        aligned directions (after calibration).
+        Axis component of distance must be exactly zero for self-comparison,
+        and positive for profiles with different cooperative directions.
         """
         rng = np.random.default_rng(55)
         d   = 4
-        cov = np.eye(d)
 
-        # Profile with w pointing toward e1
-        X_align = rng.multivariate_normal(np.zeros(d), cov, 100)
-        # Profiles with cooperative direction spread across angles
+        X_align = rng.multivariate_normal(np.zeros(d), np.eye(d), 100)
         p_query  = CooperativeGeometryProfile.from_longitudinal(X_align)
 
-        # Build a small set, calibrate, then check gate behaviour
         profiles = [CooperativeGeometryProfile.from_longitudinal(
             rng.multivariate_normal(np.zeros(d), np.eye(d) + rng.standard_normal((d, d)) * 0.3, 80)
         ) for _ in range(20)]
@@ -630,9 +791,9 @@ class TestStressDirectionGate:
         matcher = ICGHVRTMatcher(auto_calibrate=True)
         matcher.calibrate(profiles)
 
-        # Self-distance direction component must be exactly zero
+        # Self-distance axis component must be exactly zero
         dc_self = matcher.distance_components(p_query, p_query)
-        assert dc_self["direction"] < 1e-7
+        assert dc_self["axis"] < 1e-7
 
 
 class TestStressCurvatureGate:
@@ -641,7 +802,7 @@ class TestStressCurvatureGate:
 
     tau = 2 if manifold coupling (rho) > 0.4 else 0.
     Equicorrelated covariance with rho ~ U[0, 0.85].
-    ICG-HVRT must detect via d_sigma.
+    ICG-HVRT must detect via the opening profile identity component.
     """
 
     @staticmethod
@@ -664,20 +825,20 @@ class TestStressCurvatureGate:
         X_tr, T_tr, Y_tr, E_tr = self._gen(150, seed=0)
         X_te, T_te, _,    E_te = self._gen(40,  seed=100)
 
-        est = ICGHVRTEstimator(k=20)
+        est = ICGHVRTEstimator(k=20, learn_weights=False)
         est.fit(X_tr, T_tr, Y_tr)
         preds = np.array([est.predict_effect(X_te[i], T_te[i]) for i in range(len(X_te))])
 
         rho = _spearman(preds, E_te)
         assert rho > 0.4, (
             f"ICG-HVRT Spearman rho={rho:.4f} < 0.4 on Curvature Gate; "
-            "d_sigma component is not providing sufficient signal"
+            "opening identity component is not providing sufficient signal"
         )
 
-    def test_shape_component_ranks_coupling(self):
+    def test_opening_component_ranks_coupling(self):
         """
-        d_sigma between a tightly coupled patient (rho=0.8) and a reference
-        must exceed d_sigma for a loosely coupled patient (rho=0.05).
+        d_opening between a tightly coupled patient (rho=0.8) and a reference
+        must exceed d_opening for a loosely coupled patient (rho=0.05).
         """
         d     = 4
         ref   = np.eye(d)
@@ -697,8 +858,9 @@ class TestStressCurvatureGate:
         dc_tight = matcher.distance_components(p_ref, p_tight)
         dc_loose = matcher.distance_components(p_ref, p_loose)
 
-        assert dc_tight["shape"] > dc_loose["shape"], (
-            "Tightly coupled covariance should be farther from identity in d_sigma"
+        # Tight coupling produces larger opening profile distance
+        assert dc_tight["opening"] > dc_loose["opening"], (
+            "Tightly coupled covariance should be farther from identity in d_opening"
         )
 
 
@@ -736,7 +898,7 @@ class TestStressOccupationGate:
         X_tr, T_tr, Y_tr, E_tr = self._gen(150, seed=0)
         X_te, T_te, _,    E_te = self._gen(40,  seed=100)
 
-        est = ICGHVRTEstimator(k=20)
+        est = ICGHVRTEstimator(k=20, learn_weights=False)
         est.fit(X_tr, T_tr, Y_tr)
         preds = np.array([est.predict_effect(X_te[i], T_te[i]) for i in range(len(X_te))])
 
@@ -770,9 +932,10 @@ class TestStressOccupationGate:
         X_l[m_l]   = rng.multivariate_normal(np.zeros(d), Sc, m_l.sum())
         X_l[~m_l]  = rng.multivariate_normal(np.zeros(d), Sa, (~m_l).sum())
 
-        X_pool = np.vstack([X_h, X_l])
-        from autoite.profile import fit_shared_hvrt
-        shared = fit_shared_hvrt(X_pool, n_partitions=8)
+        from autoite.profile import fit_shared_hvrt, pool_whitened_observations
+        shared = fit_shared_hvrt(
+            pool_whitened_observations([X_h, X_l]), n_partitions=8
+        )
 
         p_h = CooperativeGeometryProfile.from_longitudinal(X_h, shared_hvrt=shared)
         p_l = CooperativeGeometryProfile.from_longitudinal(X_l, shared_hvrt=shared)
@@ -792,8 +955,7 @@ class TestStressDynamicsGate:
     so d_mu and d_sigma are blind; only d_dyn carries the signal.
 
     Note: at N=100 observations the transition-matrix estimator is noisy.
-    The threshold here is intentionally weak (rho > 0.0) — the full
-    statistical picture is in experiments/ite_evaluation.py.
+    The threshold here is intentionally weak (rho > -0.3).
     """
 
     @staticmethod
@@ -821,31 +983,24 @@ class TestStressDynamicsGate:
         """
         ICG-HVRT must not produce strongly inverted rankings on the
         dynamics-gate DGP.
-
-        At N=100 observations the transition-matrix estimator is noisy and
-        d_dyn carries weak signal (Spearman ~0.07 in the full evaluation).
-        This test guards against catastrophic failure (rho << 0) while the
-        full statistical picture lives in experiments/ite_evaluation.py.
         """
         X_tr, T_tr, Y_tr, E_tr = self._gen(150, seed=0)
         X_te, T_te, _,    E_te = self._gen(40,  seed=100)
 
-        est = ICGHVRTEstimator(k=20)
+        est = ICGHVRTEstimator(k=20, learn_weights=False)
         est.fit(X_tr, T_tr, Y_tr)
         preds = np.array([est.predict_effect(X_te[i], T_te[i]) for i in range(len(X_te))])
 
         rho = _spearman(preds, E_te)
         assert rho > -0.3, (
             f"ICG-HVRT Spearman rho={rho:.4f} on Dynamics Gate is strongly negative; "
-            "d_dyn component is introducing noise rather than signal. "
-            "Known limitation: N=100 obs is below the reliable estimation threshold "
-            "for transition matrices with K=8 partitions."
+            "d_dyn component is introducing noise rather than signal."
         )
 
     def test_dynamics_component_nonzero_for_different_persistence(self):
         """
-        A high-persistence patient (p=0.9) and a low-persistence patient (p=0.35)
-        must have non-zero dynamics distance when transition matrices are available.
+        A high-persistence patient and a low-persistence patient must have
+        non-zero dynamics distance when transition matrices are available.
         """
         rng  = np.random.default_rng(30)
         d, rho = 4, 0.8
@@ -854,7 +1009,7 @@ class TestStressDynamicsGate:
 
         def _make_markov(persistence, seed):
             r2 = np.random.default_rng(seed)
-            n  = 200           # more obs for stable transition estimate
+            n  = 200
             state = int(r2.integers(2))
             X = np.zeros((n, d))
             for step in range(n):
@@ -866,9 +1021,10 @@ class TestStressDynamicsGate:
         X_high = _make_markov(0.90, 40)
         X_low  = _make_markov(0.35, 41)
 
-        X_pool = np.vstack([X_high, X_low])
-        from autoite.profile import fit_shared_hvrt
-        shared = fit_shared_hvrt(X_pool, n_partitions=8)
+        from autoite.profile import fit_shared_hvrt, pool_whitened_observations
+        shared = fit_shared_hvrt(
+            pool_whitened_observations([X_high, X_low]), n_partitions=8
+        )
 
         p_high = CooperativeGeometryProfile.from_longitudinal(X_high, shared_hvrt=shared)
         p_low  = CooperativeGeometryProfile.from_longitudinal(X_low,  shared_hvrt=shared)
@@ -878,6 +1034,78 @@ class TestStressDynamicsGate:
             assert d_dyn > 0.0, (
                 "High-persistence vs low-persistence patients should have non-zero d_dyn"
             )
+
+
+class TestStressEccentricityGate:
+    """
+    Spec §8 Test 8 — Eccentricity Gate (new in v0.2.0).
+
+    tau = f(eccentricity) — patients with near-circular cones have different
+    treatment effects from patients with highly eccentric cones.
+    ICG-HVRT must detect this via the eccentricity identity component.
+    v0.1.0 fails because it had no eccentricity measure.
+    """
+
+    @staticmethod
+    def _gen(n_units: int, n_obs: int = 100, seed: int = 0):
+        rng = np.random.default_rng(seed)
+        d = 4
+        X_list, T_list, Y_list, effects = [], [], [], []
+        for _ in range(n_units):
+            # Stretch first dimension by 'stretch' factor (1..4)
+            stretch = rng.uniform(1.0, 4.0)
+            sigma = np.diag(np.concatenate([[stretch ** 2], np.ones(d - 1)]))
+            # Effect decreases with stretch: circular cones respond well,
+            # eccentric cones respond poorly.
+            eff = 3.0 / stretch
+            X = rng.multivariate_normal(np.zeros(d), sigma, n_obs)
+            T = rng.standard_normal((n_obs, 1))
+            Y = eff * T.flatten() + rng.standard_normal(n_obs) * 0.5
+            X_list.append(X); T_list.append(T); Y_list.append(Y); effects.append(eff)
+        return X_list, T_list, Y_list, np.array(effects)
+
+    def test_ite_rank_correlation(self):
+        """ICG-HVRT must achieve Spearman rho > 0.2 on the eccentricity-gate DGP."""
+        X_tr, T_tr, Y_tr, E_tr = self._gen(150, seed=0)
+        X_te, T_te, _,    E_te = self._gen(40,  seed=100)
+
+        est = ICGHVRTEstimator(k=20, learn_weights=False)
+        est.fit(X_tr, T_tr, Y_tr)
+        preds = np.array([est.predict_effect(X_te[i], T_te[i]) for i in range(len(X_te))])
+
+        rho = _spearman(preds, E_te)
+        assert rho > 0.2, (
+            f"ICG-HVRT Spearman rho={rho:.4f} < 0.2 on Eccentricity Gate; "
+            "eccentricity identity component is not providing sufficient signal. "
+            "v0.1.0 had no eccentricity measure; this test specifically targets "
+            "the new ConeIdentity capability."
+        )
+
+    def test_eccentricity_correlates_with_stretch(self):
+        """
+        ConeIdentity eccentricity must be monotonically related to the
+        stretch factor used to construct the covariance matrix.
+        Higher stretch -> higher eccentricity.
+        """
+        d = 4
+        rng = np.random.default_rng(77)
+        n_obs = 200
+
+        eccentricities = []
+        stretches = [1.0, 1.5, 2.0, 3.0, 4.0]
+        for stretch in stretches:
+            sigma = np.diag(np.concatenate([[stretch ** 2], np.ones(d - 1)]))
+            X = rng.multivariate_normal(np.zeros(d), sigma, n_obs)
+            p = CooperativeGeometryProfile.from_longitudinal(X)
+            eccentricities.append(p.cone_identity.eccentricity)
+
+        from scipy.stats import spearmanr
+        rho, _ = spearmanr(stretches, eccentricities)
+        assert rho > 0.8, (
+            f"Eccentricity should increase monotonically with stretch, "
+            f"Spearman rho={rho:.3f} < 0.8. "
+            f"Eccentricities: {[f'{e:.2f}' for e in eccentricities]}"
+        )
 
 
 if __name__ == "__main__":

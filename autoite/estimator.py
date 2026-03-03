@@ -1,33 +1,35 @@
 """
 ICGHVRTEstimator: Just-in-Time treatment effect estimation with cooperative
-geometry matching.
+cone matching.
 
-Replaces ICG's Log-Euclidean (mu, Sigma) matching with the full five-component
-cooperative manifold distance, while retaining the JIT local regression approach.
+Uses the eight-component cooperative cone distance (ICG-HVRT v0.2.0) for
+k-nearest-neighbour selection, then fits a local Ridge regression on the
+matched neighbourhood to estimate the individual treatment effect.
 """
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from sklearn.linear_model import Ridge
 
-from .profile import CooperativeGeometryProfile, SharedHVRT, fit_shared_hvrt
+from .profile import CooperativeGeometryProfile, SharedHVRT, fit_shared_hvrt, pool_whitened_observations
 from .matcher import ICGHVRTMatcher
 
 
 class ICGHVRTEstimator:
     """
-    JIT treatment effect estimator using five-component cooperative geometry matching.
+    JIT treatment effect estimator using eight-component cooperative cone matching.
 
     Workflow
     --------
     1. fit(X_list, T_list, Y_list) — build per-patient profiles, calibrate matcher.
-    2. predict_effect(X_new, T_new) — match query against training, fit local Ridge,
-       return treatment coefficient as ITE estimate.
+    2. predict_effect(X_new, T_new) — match query against training by unified
+       cone distance, fit local Ridge on k-NN neighbourhood, return treatment
+       coefficient as ITE estimate.
 
     The API mirrors IntrinsicJIT for direct benchmark comparability.
 
     Parameters
     ----------
-    matcher : ICGHVRTMatcher instance (five-component distance)
+    matcher : ICGHVRTMatcher instance (eight-component cone distance)
     k : number of nearest neighbours for local regression
     alpha_local : Ridge regularisation strength for local model
     n_partitions : number of HVRT partitions for shared HVRT
@@ -43,6 +45,8 @@ class ICGHVRTEstimator:
         n_partitions: int = 8,
         y_weight: float = 0.0,
         random_state: int = 42,
+        learn_weights: bool = False,
+        geometry: str = 'cone',
     ) -> None:
         self.matcher = matcher or ICGHVRTMatcher()
         self.k = k
@@ -50,6 +54,8 @@ class ICGHVRTEstimator:
         self.n_partitions = n_partitions
         self.y_weight = y_weight
         self.random_state = random_state
+        self.learn_weights = learn_weights
+        self.geometry = geometry  # 'cone' (SD-HVRT) | 'pyramid' (MAD-HART)
 
         self._profiles: List[CooperativeGeometryProfile] = []
         self._obs_list: List[np.ndarray] = []   # raw (N_i, d) feature observations
@@ -76,19 +82,27 @@ class ICGHVRTEstimator:
         T_list : list of (N_i, 1) or (N_i,) treatment observation vectors
         Y_list : list of (N_i,) outcome observation vectors
         """
-        # Pool all feature observations to fit shared HVRT
-        X_pool = np.vstack(X_list)
+        # Determine geometry mode
+        use_mad = (self.geometry == 'pyramid')
+        import hvrt as _hvrt
+        # Pyramid → PyramidHART (MAD whitening, A = |S|−‖z‖₁ partitioning).
+        # Cone   → HVRT (SD whitening, T = S²−Q partitioning, default).
+        model_cls = _hvrt.PyramidHART if use_mad else None  # None -> HVRT default
+
+        # Pool whitened observations to fit shared HVRT/HART in a universal reference frame
+        Z_pool = pool_whitened_observations(X_list, use_mad=use_mad)
         self._shared_hvrt = fit_shared_hvrt(
-            X_pool,
+            Z_pool,
             n_partitions=self.n_partitions,
             y_weight=self.y_weight,
             random_state=self.random_state,
+            model_class=model_cls,
         )
 
         # Build per-patient profiles
         self._profiles = [
             CooperativeGeometryProfile.from_longitudinal(
-                X, shared_hvrt=self._shared_hvrt
+                X, shared_hvrt=self._shared_hvrt, use_mad=use_mad
             )
             for X in X_list
         ]
@@ -101,6 +115,12 @@ class ICGHVRTEstimator:
         if self.matcher.auto_calibrate:
             self.matcher.calibrate(self._profiles)
             self.matcher._calibrated = True  # prevent re-calibration per query
+
+        if self.learn_weights:
+            self.matcher.fit_weights(
+                self._profiles, self._obs_list, self._T_list, self._Y_list,
+                k=self.k, alpha_local=self.alpha_local,
+            )
 
         return self
 
@@ -127,8 +147,9 @@ class ICGHVRTEstimator:
         -------
         tau_hat : estimated treatment effect (T coefficient in local Ridge)
         """
+        use_mad = (self.geometry == 'pyramid')
         query_profile = CooperativeGeometryProfile.from_longitudinal(
-            np.atleast_2d(X_new), shared_hvrt=self._shared_hvrt
+            np.atleast_2d(X_new), shared_hvrt=self._shared_hvrt, use_mad=use_mad
         )
         T_new_2d = np.atleast_2d(T_new).reshape(-1, 1)
 
@@ -176,34 +197,47 @@ class ICGHVRTEstimator:
         X_test_list: List[np.ndarray],
     ) -> List[Dict]:
         """
-        Generate per-patient triage report for test patients.
+        Generate per-patient uncertainty report for test patients.
 
         Returns a list of dicts with keys:
-          'nearest_distance', 'n_direction_gate_passed', 'confidence'.
+          'nearest_distance'    -- total distance to the nearest neighbour
+          'mean_identity_distance' -- average identity distance across k-NN
+                                     (high = geometrically poor matches)
+          'confidence'          -- 'high', 'medium', 'low', or 'uncertain'
+
+        Confidence logic: similarity is continuous, not binary.
+        'nearest_distance' measures overall match quality; 'mean_identity_distance'
+        measures specifically how well the matched cone families agree.
+        A prediction backed by geometrically compatible neighbours (low
+        mean_identity_distance) is more trustworthy even when the total
+        distance is moderate.
         """
+        use_mad = (self.geometry == 'pyramid')
         report = []
         for X in X_test_list:
             qp = CooperativeGeometryProfile.from_longitudinal(
-                np.atleast_2d(X), shared_hvrt=self._shared_hvrt
+                np.atleast_2d(X), shared_hvrt=self._shared_hvrt, use_mad=use_mad
             )
             k = min(self.k, len(self._profiles))
             idx = self.matcher.find_neighbours(qp, self._profiles, k=k)
             nearest_dist = self.matcher.distance(qp, self._profiles[idx[0]])
-            gate_passes = sum(
-                self.matcher.distance_components(qp, self._profiles[j])["direction_gate_passed"]
+            id_dists = [
+                self.matcher.distance_components(qp, self._profiles[j])["identity_distance"]
                 for j in idx
-            )
-            if nearest_dist < 0.5 and gate_passes >= k * 0.8:
+            ]
+            mean_id_dist = float(np.mean(id_dists)) if id_dists else 0.0
+
+            if nearest_dist < 0.5 and mean_id_dist < 0.5:
                 confidence = "high"
-            elif nearest_dist < 1.5 and gate_passes >= k * 0.5:
+            elif nearest_dist < 1.5 and mean_id_dist < 1.5:
                 confidence = "medium"
-            elif gate_passes > 0:
+            elif nearest_dist < 3.0:
                 confidence = "low"
             else:
-                confidence = "triage"
+                confidence = "uncertain"
             report.append({
-                "nearest_distance": nearest_dist,
-                "n_direction_gate_passed": gate_passes,
-                "confidence": confidence,
+                "nearest_distance":      nearest_dist,
+                "mean_identity_distance": mean_id_dist,
+                "confidence":            confidence,
             })
         return report

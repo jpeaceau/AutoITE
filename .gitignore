@@ -64,5 +64,16 @@ unified_benchmark.png
 # Specification document (local reference only)
 icg_hvrt_specification.md
 
+# C++ extension build artifacts
+_build_ext/
+*.pyd
+*.exp
+*.lib
+*.manifest
+autoite/_core.*.pyd
+
+# PDF output files
+*.pdf
+
 # Scratch files
 nul

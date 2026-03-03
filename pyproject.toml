@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoite"
+version = "2.1.0"
+description = "Individual Treatment Effect estimation via Intrinsic Causal Geometry (ICG-HVRT cone + ICG-HART pyramid)"
+license = "AGPL-3.0"
+requires-python = ">=3.10"
+dependencies = [
+    "hvrt>=2.11.0",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "scikit-learn>=1.3",
+]
+
+[project.optional-dependencies]
+dev     = ["pytest>=7", "build"]
+cpp-dev = ["scikit-build-core>=0.10", "pybind11>=3.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["autoite*"]
+exclude = ["tests*", "experiments*", ".venv*"]
+
+# ── scikit-build-core configuration (used when build-backend is switched) ── #
+# To build with C++ extension:
+#   pip install scikit-build-core pybind11
+#   EIGEN3_INCLUDE_DIR=<path> pip install -e . --no-build-isolation \
+#       --config-settings="build-system.requires=['scikit-build-core','pybind11']" \
+#       --config-settings="build-system.build-backend=scikit_build_core.build"
+#
+# Or simply: build_ext.bat   (Windows; uses VS 2019 Build Tools)
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages    = ["autoite"]
+
+[tool.scikit-build.cmake.define]
+EIGEN3_INCLUDE_DIR = {env = "EIGEN3_INCLUDE_DIR", default = ""}
