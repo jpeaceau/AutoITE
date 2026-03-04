@@ -96,8 +96,8 @@ def _python_loo_objective(inp):
     k            = inp["k"]
     alpha        = inp["alpha"]
     n_eval       = inp["n_eval"]
-    N            = inp["N"]
-    d            = inp["d"]
+    _N           = inp["N"]
+    _d           = inp["d"]
 
     eff_w = weights / scales
     total_mse = 0.0
@@ -327,7 +327,7 @@ class TestLooObjectivePerformance:
         n_eval=40, max_iter=50 — verifies the full integration path.
         """
         from autoite.estimator import ICGHVRTEstimator
-        from autoite.matcher import ICGHVRTMatcher, _HAS_CPP
+        from autoite.matcher import _HAS_CPP
 
         if not _HAS_CPP:
             pytest.skip("_core not available")

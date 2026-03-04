@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev     = ["pytest>=7", "build"]
+dev     = ["pytest>=7", "pytest-cov", "build"]
 cpp-dev = ["scikit-build-core>=0.10", "pybind11>=3.0"]
 
 [tool.setuptools.packages.find]
@@ -32,6 +32,13 @@ exclude = ["tests*", "experiments*", ".venv*"]
 #       --config-settings="build-system.build-backend=scikit_build_core.build"
 #
 # Or simply: build_ext.bat   (Windows; uses VS 2019 Build Tools)
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]   # line-length checked by formatter, not linter
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E701", "E702"]   # compact multi-statement test helpers are intentional
+
 [tool.scikit-build]
 cmake.build-type = "Release"
 wheel.packages    = ["autoite"]

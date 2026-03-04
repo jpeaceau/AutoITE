@@ -276,9 +276,9 @@ class ICGHVRTMatcher:
         rng = np.random.default_rng(42)
         idx = rng.choice(n, min(n, 100), replace=False)
         pairs = [
-            (idx[k], idx[l])
+            (idx[k], idx[m])
             for k in range(len(idx))
-            for l in range(k + 1, min(k + 8, len(idx)))
+            for m in range(k + 1, min(k + 8, len(idx)))
         ]
 
         ax, op, ec, ori, lv_coop, lv_perp, oc, dy = [], [], [], [], [], [], [], []

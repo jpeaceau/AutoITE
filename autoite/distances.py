@@ -42,7 +42,6 @@ When Sigma ~ I, w ~ 1, so:
 import numpy as np
 from dataclasses import dataclass
 from numpy.linalg import eigh, norm
-from typing import Optional
 
 
 # ── ConeIdentity ─────────────────────────────────────────────────────── #

@@ -13,7 +13,6 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from autoite import (
     ConeIdentity,
     CooperativeGeometryProfile,
-    SharedHVRT,
     fit_shared_hvrt,
     ICGHVRTMatcher,
     ICGHVRTEstimator,
@@ -224,7 +223,6 @@ class TestConeIdentity:
 
     def test_eccentricity_anisotropic(self):
         """Anisotropic Sigma gives eccentricity > 1.0."""
-        d = 4
         # Strong anisotropy: first dimension has 16x more variance
         sigma = np.diag([16.0, 1.0, 1.0, 1.0])
         ci = ConeIdentity.from_covariance(sigma)
@@ -1002,7 +1000,6 @@ class TestStressDynamicsGate:
         A high-persistence patient and a low-persistence patient must have
         non-zero dynamics distance when transition matrices are available.
         """
-        rng  = np.random.default_rng(30)
         d, rho = 4, 0.8
         Sc = (1 - rho) * np.eye(d) + rho * np.ones((d, d)) + 1e-4 * np.eye(d)
         Sa = np.eye(d)
@@ -1150,8 +1147,7 @@ class TestSynergyGeometry:
 
     def test_synergy_vs_cone_on_spike_dgp(self):
         """Synergy PEHE < cone PEHE on the Outlier Spike DGP."""
-        rng = np.random.default_rng(42)
-        d = 4; rho = 0.9; spike_mag = 20.0; spike_frac = 0.05
+        d = 4; rho = 0.9; spike_mag = 20.0; spike_frac = 0.05  # noqa: E702
         Sc = (1 - rho) * np.eye(d) + rho * np.ones((d, d)) + 1e-4 * np.eye(d)
         Sa = np.eye(d)
 
@@ -1219,7 +1215,7 @@ class TestIndividualCovariateLeak:
     def test_mean_leak_is_weak(self):
         """Aggregate mean(X[:,0]) should be close to 0 for U~U[-1,1], K=3, amp=8."""
         sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-        from experiments.ite_comparison import gen_individual_covariate_leak, N_OBS
+        from experiments.ite_comparison import gen_individual_covariate_leak
         np.random.seed(0)
         X, _, _, E = gen_individual_covariate_leak(500)
         means_f0 = np.array([np.mean(xi[:, 0]) for xi in X])
@@ -1339,7 +1335,7 @@ class TestSelectivePrediction:
 
     def test_coverage_pehe_monotone(self):
         """PEHE should not increase as coverage decreases on a clean DGP."""
-        from experiments.ite_comparison import gen_geometric_confounded, N_OBS
+        from experiments.ite_comparison import gen_geometric_confounded
         np.random.seed(42)
         X_tr, T_tr, Y_tr, _     = gen_geometric_confounded(80)
         X_te, T_te, Y_te, E_te  = gen_geometric_confounded(30)

@@ -114,8 +114,6 @@ def run_three_world_test():
 
     train_patients = [all_patients[i] for i in train_idx]
     test_patients = [all_patients[i] for i in test_idx]
-    train_matrices = all_matrices[train_idx]
-    test_matrices = all_matrices[test_idx]
     train_distances = distances[train_idx]
     test_distances = distances[test_idx]
 
@@ -129,7 +127,6 @@ def run_three_world_test():
     jit_aug.fit(X_train, T_train, Y_train)
 
     # Distance statistics
-    dist_mean, dist_std = np.mean(train_distances), np.std(train_distances)
     dist_p25 = np.percentile(train_distances, 25)
 
     # Local X-Learner

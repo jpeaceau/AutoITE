@@ -7,7 +7,7 @@ k-nearest-neighbour selection, then fits a local Ridge regression on the
 matched neighbourhood to estimate the individual treatment effect.
 """
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from sklearn.linear_model import Ridge, LinearRegression
 
 from .profile import CooperativeGeometryProfile, SharedHVRT, fit_shared_hvrt, pool_whitened_observations, pool_synergy_whitened
@@ -200,8 +200,6 @@ class ICGHVRTEstimator:
         query_profile = CooperativeGeometryProfile.from_longitudinal(
             np.atleast_2d(X_new), shared_hvrt=self._shared_hvrt, use_mad=use_mad,
         )
-        T_new_2d = np.atleast_2d(T_new).reshape(-1, 1)
-
         neighbour_idx, neighbour_dists = self.matcher.find_neighbours(
             query_profile, self._profiles, k=self.k,
             exclude_idx=exclude_idx, return_distances=True,

@@ -18,7 +18,7 @@ class IntrinsicJIT:
             # Compute State: (Mean, Covariance)
             mu = np.mean(obs, axis=0)
             cov = np.cov(obs, rowvar=False)
-            
+
             # Pre-calculate logm for efficiency
             # Regularize
             c_reg = cov + 1e-6 * np.eye(cov.shape[0])
@@ -33,22 +33,22 @@ class IntrinsicJIT:
         obs_new = np.column_stack([X_new, T_new])
         mu_new = np.mean(obs_new, axis=0)
         cov_new = np.cov(obs_new, rowvar=False)
-        
+
         c_new_reg = cov_new + 1e-6 * np.eye(cov_new.shape[0])
         log_cov_new = logm(c_new_reg)
-        
+
         # 2. Scan History
         dists = []
         for h in self.history_state:
             mu_h, cov_h, log_cov_h = h
-            
+
             # Structural Distance
             dist_struct = norm(log_cov_new - log_cov_h)
-            
+
             if self.geometry == 'pure':
                 dists.append(dist_struct)
                 continue
-                
+
             # Level Distance
             dist_level = np.linalg.norm(mu_new - mu_h)
             dists.append(dist_struct + dist_level)

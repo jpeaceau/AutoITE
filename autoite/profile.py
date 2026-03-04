@@ -12,9 +12,8 @@ cone is circular; in original space it is generally elliptical.
 """
 import numpy as np
 from numpy.linalg import eigh
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
-import warnings
 
 from .distances import ConeIdentity
 
@@ -84,9 +83,11 @@ def fit_shared_hvrt(
     # HVRT / HART partitions by E_T (same ordering logic, different statistic).
     _is_pyramid = isinstance(model, getattr(_hvrt, "PyramidHART", type(None)))
     if _is_pyramid:
-        sort_key = lambda p: p.get("A_mean", 0.0)
+        def sort_key(p):
+            return p.get("A_mean", 0.0)
     else:
-        sort_key = lambda p: p.get("E_T", 0.0)
+        def sort_key(p):
+            return p.get("E_T", 0.0)
 
     partitions_sorted = sorted(partitions, key=sort_key)
     id_to_rank = {p["id"]: i for i, p in enumerate(partitions_sorted)}
@@ -414,9 +415,9 @@ class CooperativeGeometryProfile:
                 # Transition matrix (Markov estimates)
                 M = np.zeros((actual_K, actual_K))
                 for t in range(len(ranked_ids) - 1):
-                    k, l = int(ranked_ids[t]), int(ranked_ids[t + 1])
-                    if 0 <= k < actual_K and 0 <= l < actual_K:
-                        M[k, l] += 1.0
+                    k, m = int(ranked_ids[t]), int(ranked_ids[t + 1])
+                    if 0 <= k < actual_K and 0 <= m < actual_K:
+                        M[k, m] += 1.0
                 row_sums = M.sum(axis=1, keepdims=True)
                 transition_matrix = M / np.where(row_sums > 0, row_sums, 1.0)
 
