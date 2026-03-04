@@ -93,6 +93,45 @@ def fit_shared_hvrt(
     return SharedHVRT(model=model, id_to_rank=id_to_rank, n_partitions=len(partitions_sorted))
 
 
+def pool_synergy_whitened(
+    X_list: list,
+    spike_fraction: float = 0.05,
+    regularization: float = 1e-4,
+) -> np.ndarray:
+    """
+    Two-stage synergy pooling (PyramidHART → HVRT pipeline).
+
+    Stage 1 — MAD-whiten each patient's observations (spike-robust normalisation,
+               matching hvrt.PyramidHART's internal scaling exactly).
+
+    Stage 2 — Detect and remove spike samples globally using the |A|/‖z‖₁ score
+               (Proposition 1.3: a single dominant feature cancels from A exactly,
+               so high |A|/‖z‖₁ ≈ 1 unmistakably flags sign-divergent outliers).
+
+    The returned Z_bulk is spike-free and suitable for fitting HVRT (not
+    PyramidHART), so Theorem 3 (noise invariance of E[T]) holds cleanly on
+    the remaining bulk without single-feature spike interference.
+    """
+    from hvrt import detect_spikes as _detect_spikes
+
+    whitened = []
+    for X in X_list:
+        obs = np.atleast_2d(X)
+        med = np.median(obs, axis=0)
+        mad = np.median(np.abs(obs - med), axis=0)
+        sigma_hat = np.maximum(_MAD_SCALE * mad, regularization)
+        whitened.append((obs - med) / sigma_hat)
+    Z_all = np.vstack(whitened)
+
+    spike_mask, _ = _detect_spikes(Z_all, spike_fraction=spike_fraction)
+    Z_bulk = Z_all[~spike_mask]
+
+    # Guard: if spike removal was too aggressive, fall back to full Z
+    if len(Z_bulk) < max(10, len(Z_all) // 4):
+        return Z_all
+    return Z_bulk
+
+
 def pool_whitened_observations(
     X_list: list,
     regularization: float = 1e-4,
@@ -203,6 +242,7 @@ class CooperativeGeometryProfile:
         n_partitions: int = 8,
         regularization: float = 1e-4,
         use_mad: bool = False,
+        spike_fraction: float = 0.0,
     ) -> "CooperativeGeometryProfile":
         """
         Build a cooperative geometry profile from longitudinal feature observations.
@@ -257,6 +297,12 @@ class CooperativeGeometryProfile:
 
             # Stage 6: Element-wise sigma_hat whitening (matches hvrt.PyramidHART)
             Z = (observations - med) / sigma_hat  # (n_obs, d)
+
+            # Note: spike_fraction is intentionally NOT applied here.
+            # Per-patient filtering would remove valid anti-cooperative observations
+            # (e.g. uncoupled patients' tau=0 signal) and bias partition profiles toward
+            # cooperation. The synergy filtering belongs only at the global pool level
+            # in pool_synergy_whitened(), not per-patient.
 
         else:
             # ── SD path: cone (ellipsoidal) geometry ────────────────────

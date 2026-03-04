@@ -644,7 +644,8 @@ class ICGHVRTMatcher:
         training_profiles: List[CooperativeGeometryProfile],
         k: int,
         exclude_idx: Optional[int] = None,
-    ) -> np.ndarray:
+        return_distances: bool = False,
+    ):
         """
         Return the indices of the k nearest training profiles to the query,
         ranked by the unified eight-component total distance.
@@ -659,6 +660,9 @@ class ICGHVRTMatcher:
         training_profiles : list of training profiles
         k : number of nearest neighbours to return
         exclude_idx : index to skip (for leave-one-out cross-validation)
+        return_distances : if True, return (indices, distances) tuple instead
+            of just indices.  Distances are the raw total distance values for
+            the k selected neighbours, in ranked order (nearest first).
         """
         if self.auto_calibrate and not self._calibrated:
             self.calibrate(training_profiles)
@@ -698,7 +702,10 @@ class ICGHVRTMatcher:
             )
             if exclude_idx is not None:
                 dists[exclude_idx] = np.inf
-            return np.argsort(dists)[:k_eff]
+            order = np.argsort(dists)[:k_eff]
+            if return_distances:
+                return order, dists[order]
+            return order
 
         # ── Pure-Python fallback ──────────────────────────────────────────
         dists = np.full(n, np.inf)
@@ -706,4 +713,7 @@ class ICGHVRTMatcher:
             if j == exclude_idx:
                 continue
             dists[j] = self.distance(query_profile, p_j)
-        return np.argsort(dists)[:k_eff]
+        order = np.argsort(dists)[:k_eff]
+        if return_distances:
+            return order, dists[order]
+        return order

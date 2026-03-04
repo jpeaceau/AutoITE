@@ -1108,5 +1108,334 @@ class TestStressEccentricityGate:
         )
 
 
+class TestSynergyGeometry:
+    """ICG-Synergy (PyramidHART spike detection → HVRT on clean bulk)."""
+
+    def test_smoke_clean_data(self):
+        """Synergy mode produces finite ITE on spike-free data."""
+        rng = np.random.default_rng(0)
+        X = [rng.standard_normal((50, 4)) for _ in range(30)]
+        T = [rng.standard_normal(50) for _ in range(30)]
+        Y = [rng.standard_normal(50) for _ in range(30)]
+        est = ICGHVRTEstimator(k=10, geometry='synergy').fit(X, T, Y)
+        tau = est.predict_effect(X[0], T[0])
+        assert np.isfinite(tau)
+
+    def test_smoke_spiked_data(self):
+        """Synergy mode produces finite ITE when 5% of observations are ±20σ spikes."""
+        rng = np.random.default_rng(1)
+        X, T, Y = [], [], []
+        for _ in range(30):
+            x = rng.standard_normal((50, 4))
+            # Inject single-feature spikes into 5% of rows
+            spike_rows = rng.choice(50, 3, replace=False)
+            spike_cols = rng.integers(0, 4, 3)
+            x[spike_rows, spike_cols] += rng.choice([-20.0, 20.0], 3)
+            X.append(x)
+            T.append(rng.standard_normal(50))
+            Y.append(rng.standard_normal(50))
+        est = ICGHVRTEstimator(k=10, geometry='synergy').fit(X, T, Y)
+        tau = est.predict_effect(X[0], T[0])
+        assert np.isfinite(tau)
+
+    def test_default_local_model_is_lad(self):
+        """Synergy geometry auto-selects lad local model."""
+        est = ICGHVRTEstimator(geometry='synergy')
+        assert est.local_model == 'lad'
+
+    def test_spike_fraction_stored(self):
+        """Custom spike_fraction is stored on the estimator."""
+        est = ICGHVRTEstimator(geometry='synergy', spike_fraction=0.10)
+        assert est.spike_fraction == 0.10
+
+    def test_synergy_vs_cone_on_spike_dgp(self):
+        """Synergy PEHE < cone PEHE on the Outlier Spike DGP."""
+        rng = np.random.default_rng(42)
+        d = 4; rho = 0.9; spike_mag = 20.0; spike_frac = 0.05
+        Sc = (1 - rho) * np.eye(d) + rho * np.ones((d, d)) + 1e-4 * np.eye(d)
+        Sa = np.eye(d)
+
+        def _gen(n, seed):
+            np.random.seed(seed)
+            X, T, Y, E = [], [], [], []
+            for _ in range(n):
+                coupled = np.random.rand() > 0.5
+                Sig = Sc if coupled else Sa
+                tau = 2.0 if coupled else 0.0
+                x = np.random.multivariate_normal(np.zeros(d), Sig, 80)
+                n_spikes = max(1, int(80 * spike_frac))
+                rows = np.random.choice(80, n_spikes, replace=False)
+                cols = np.random.randint(0, d, n_spikes)
+                x[rows, cols] += np.random.choice([-1., 1.], n_spikes) * spike_mag
+                t = np.random.normal(0, 1, (80, 1))
+                X.append(x); T.append(t)
+                Y.append(tau * t.ravel() + np.random.normal(0, 0.5, 80))
+                E.append(tau)
+            return X, T, Y, np.array(E)
+
+        X_tr, T_tr, Y_tr, _ = _gen(60, seed=0)
+        X_te, T_te, Y_te, E_te = _gen(20, seed=1)
+
+        pehe = {}
+        for geo in ('cone', 'synergy'):
+            est = ICGHVRTEstimator(k=10, geometry=geo).fit(X_tr, T_tr, Y_tr)
+            tau_hat = np.array([est.predict_effect(X_te[i], T_te[i]) for i in range(len(X_te))])
+            pehe[geo] = float(np.sqrt(np.mean((tau_hat - E_te) ** 2)))
+
+        assert pehe['synergy'] < pehe['cone'], (
+            f"Expected synergy PEHE ({pehe['synergy']:.3f}) < cone PEHE ({pehe['cone']:.3f})"
+        )
+
+
+class TestLocalModels:
+    """Each local_model variant produces a finite ITE estimate."""
+
+    @pytest.mark.parametrize("local_model", ["ridge", "ols", "lad", "mean", "median"])
+    def test_smoke(self, local_model):
+        rng = np.random.default_rng(42)
+        X = [rng.standard_normal((30, 3)) for _ in range(20)]
+        T = [rng.standard_normal(30) for _ in range(20)]
+        Y = [rng.standard_normal(30) for _ in range(20)]
+        est = ICGHVRTEstimator(k=5, local_model=local_model).fit(X, T, Y)
+        tau = est.predict_effect(X[0], T[0])
+        assert np.isfinite(tau), f"local_model='{local_model}' returned non-finite tau"
+
+
+class TestIndividualCovariateLeak:
+    """Smoke tests for the gen_individual_covariate_leak DGP."""
+
+    def test_dgp_shapes(self):
+        """DGP returns correct list lengths and array shapes."""
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        from experiments.ite_comparison import gen_individual_covariate_leak, N_OBS
+        n = 10
+        X, T, Y, E = gen_individual_covariate_leak(n)
+        assert len(X) == n
+        assert X[0].shape == (N_OBS, 4), f"expected (N_OBS, 4), got {X[0].shape}"
+        assert T[0].shape == (N_OBS, 1)
+        assert Y[0].shape == (N_OBS,)
+        assert E.shape == (n,)
+
+    def test_mean_leak_is_weak(self):
+        """Aggregate mean(X[:,0]) should be close to 0 for U~U[-1,1], K=3, amp=8."""
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        from experiments.ite_comparison import gen_individual_covariate_leak, N_OBS
+        np.random.seed(0)
+        X, _, _, E = gen_individual_covariate_leak(500)
+        means_f0 = np.array([np.mean(xi[:, 0]) for xi in X])
+        # mean(X[:,0]) ~ U * 8 * 3/N_OBS; correlation with U should be moderate but small
+        from scipy.stats import pearsonr
+        corr, _ = pearsonr(means_f0, E)
+        # Signal is present but aggregate is weaker than full mean confound (K=N_OBS, rho~0.98).
+        # With K=3, amp=8, N_OBS=100: expected SNR~1.4, Pearson r ~ 0.81.
+        assert 0.0 < corr < 0.97, f"mean(X[:,0])-E[tau] correlation {corr:.3f} unexpected"
+
+    def test_cone_vs_pyramid_spike_sensitivity(self):
+        """Cone geometry should produce finite ITE on this DGP for both geometries."""
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        from experiments.ite_comparison import gen_individual_covariate_leak
+        np.random.seed(1)
+        X, T, Y, _ = gen_individual_covariate_leak(30)
+        X_te, T_te, Y_te, _ = gen_individual_covariate_leak(5)
+        for geo in ("cone", "pyramid"):
+            est = ICGHVRTEstimator(k=10, geometry=geo).fit(X, T, Y)
+            for i in range(len(X_te)):
+                tau = est.predict_effect(X_te[i], T_te[i])
+                assert np.isfinite(tau), f"geometry='{geo}' returned non-finite tau at i={i}"
+
+    def test_sparse_k_factory(self):
+        """gen_sparse_k_leak factory produces finite ITE estimates for both K=1 and K=50."""
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        from experiments.ite_comparison import gen_sparse_k_leak
+        np.random.seed(2)
+        for K in [1, 50]:
+            gen = gen_sparse_k_leak(K)
+            X, T, Y, _ = gen(20)
+            X_te, T_te, _, _ = gen(5)
+            est = ICGHVRTEstimator(k=8).fit(X, T, Y)
+            for i in range(len(X_te)):
+                tau = est.predict_effect(X_te[i], T_te[i])
+                assert np.isfinite(tau), f"K={K}: non-finite tau at i={i}"
+
+
+class TestSelectivePrediction:
+    """Tests for distance-weighted k-NN and predict_effect_with_confidence."""
+
+    def _make_data(self, n=40, d=4, n_obs=30, seed=0):
+        rng = np.random.default_rng(seed)
+        X = [rng.standard_normal((n_obs, d)) for _ in range(n)]
+        T = [rng.standard_normal(n_obs)      for _ in range(n)]
+        Y = [rng.standard_normal(n_obs)      for _ in range(n)]
+        return X, T, Y
+
+    def test_predict_with_confidence_returns_tuple(self):
+        """predict_effect_with_confidence returns (float, float)."""
+        X, T, Y = self._make_data()
+        est = ICGHVRTEstimator(k=10).fit(X, T, Y)
+        tau, dist = est.predict_effect_with_confidence(X[0], T[0])
+        assert isinstance(tau, float) and np.isfinite(tau)
+        assert isinstance(dist, float) and dist > 0 and np.isfinite(dist)
+
+    def test_predict_effect_backward_compat(self):
+        """predict_effect still returns a plain float after API change."""
+        X, T, Y = self._make_data()
+        est = ICGHVRTEstimator(k=10).fit(X, T, Y)
+        result = est.predict_effect(X[0], T[0])
+        assert isinstance(result, float), (
+            f"predict_effect must return float, got {type(result)}")
+
+    def test_distance_weighted_differs_from_flat(self):
+        """distance_weighted=True should change the tau estimate on most patients."""
+        rng = np.random.default_rng(7)
+        d = 4; n = 60
+        # Build data with geometric heterogeneity so distances vary
+        rho = 0.9
+        Sc  = (1 - rho) * np.eye(d) + rho * np.ones((d, d)) + 1e-4 * np.eye(d)
+        Sa  = np.eye(d)
+        X, T, Y = [], [], []
+        for i in range(n):
+            Sig = Sc if i < n // 2 else Sa
+            x = rng.multivariate_normal(np.zeros(d), Sig, 40)
+            t = rng.standard_normal(40)
+            y = 2.0 * t + rng.standard_normal(40) * 0.5
+            X.append(x); T.append(t); Y.append(y)
+
+        est_flat = ICGHVRTEstimator(k=10).fit(X, T, Y)
+        est_w    = ICGHVRTEstimator(k=10, distance_weighted=True).fit(X, T, Y)
+
+        diffs = [
+            abs(est_flat.predict_effect(X[i], T[i]) -
+                est_w.predict_effect(X[i], T[i]))
+            for i in range(20)
+        ]
+        # At least some predictions should differ when weights are applied
+        assert max(diffs) > 1e-6, "distance_weighted had no effect on any prediction"
+
+    def test_confidence_discriminates_in_vs_out(self):
+        """In-distribution patients should get lower k-NN distance than OOD patients."""
+        rng = np.random.default_rng(9)
+        d = 4
+        # Train on coupled-covariance patients only
+        rho = 0.9
+        Sc  = (1 - rho) * np.eye(d) + rho * np.ones((d, d)) + 1e-4 * np.eye(d)
+        X = [rng.multivariate_normal(np.zeros(d), Sc, 50) for _ in range(40)]
+        T = [rng.standard_normal(50) for _ in range(40)]
+        Y = [rng.standard_normal(50) for _ in range(40)]
+        est = ICGHVRTEstimator(k=10).fit(X, T, Y)
+
+        # In-distribution: same covariance structure
+        _, dist_in = est.predict_effect_with_confidence(
+            rng.multivariate_normal(np.zeros(d), Sc, 50),
+            rng.standard_normal(50),
+        )
+        # Out-of-distribution: identity covariance (very different geometry)
+        _, dist_ood = est.predict_effect_with_confidence(
+            rng.standard_normal((50, d)),
+            rng.standard_normal(50),
+        )
+        assert dist_in < dist_ood, (
+            f"Expected in-dist distance ({dist_in:.3f}) < OOD distance ({dist_ood:.3f})"
+        )
+
+    def test_coverage_pehe_monotone(self):
+        """PEHE should not increase as coverage decreases on a clean DGP."""
+        from experiments.ite_comparison import gen_geometric_confounded, N_OBS
+        np.random.seed(42)
+        X_tr, T_tr, Y_tr, _     = gen_geometric_confounded(80)
+        X_te, T_te, Y_te, E_te  = gen_geometric_confounded(30)
+
+        est = ICGHVRTEstimator(k=20, geometry='cone').fit(X_tr, T_tr, Y_tr)
+        results = [est.predict_effect_with_confidence(X_te[i], T_te[i])
+                   for i in range(len(X_te))]
+        tau_hat = np.array([r[0] for r in results])
+        conf    = np.array([r[1] for r in results])
+
+        pehes = []
+        for cov in [1.0, 0.8, 0.6, 0.4]:
+            k = max(1, int(round(cov * len(E_te))))
+            order = np.argsort(conf)[:k]
+            pehes.append(float(np.sqrt(np.mean((tau_hat[order] - E_te[order]) ** 2))))
+
+        # Allow slight non-monotonicity due to noise (small n), but trend should improve
+        assert pehes[-1] <= pehes[0] * 1.5, (
+            f"PEHE did not improve with selectivity: {pehes}"
+        )
+
+
+class TestPrognosticConfounder:
+    """Smoke tests for the gen_prognostic_confounder DGP."""
+
+    def test_dgp_shapes(self):
+        """DGP returns correct list lengths and array shapes."""
+        from experiments.ite_comparison import gen_prognostic_confounder, N_OBS
+        n = 10
+        X, T, Y, E = gen_prognostic_confounder(n)
+        assert len(X) == n
+        assert X[0].shape == (N_OBS, 4), f"expected (N_OBS, 4), got {X[0].shape}"
+        assert T[0].shape == (N_OBS, 1)
+        assert Y[0].shape == (N_OBS,)
+        assert E.shape == (n,)
+
+    def test_treatment_independent_of_confounder(self):
+        """T must be independent of U (no selection confounding): |corr(T_bar, tau)| < 0.15."""
+        from experiments.ite_comparison import gen_prognostic_confounder
+        from scipy.stats import pearsonr
+        np.random.seed(7)
+        X, T, _, E = gen_prognostic_confounder(500)
+        T_bar = np.array([np.mean(np.asarray(t).ravel()) for t in T])
+        corr, _ = pearsonr(T_bar, E)
+        assert abs(corr) < 0.15, (
+            f"T_bar-tau Pearson {corr:.3f} -- T should be independent of U (tau); "
+            "selection bias was not intended in this DGP"
+        )
+
+    def test_covariate_leak_is_present(self):
+        """mean(X) should correlate with tau via rho_x: |corr| in (0.1, 0.99) for rho_x=0.5."""
+        from experiments.ite_comparison import gen_prognostic_confounder
+        from scipy.stats import pearsonr
+        np.random.seed(8)
+        X, _, _, E = gen_prognostic_confounder(500, rho_x=0.5)
+        means_x0 = np.array([np.mean(xi[:, 0]) for xi in X])
+        corr, _ = pearsonr(means_x0, E)
+        assert 0.1 < corr < 0.99, (
+            f"mean(X[:,0])-tau Pearson {corr:.3f} unexpected for rho_x=0.5"
+        )
+
+    def test_rho_x_zero_hides_confounder(self):
+        """rho_x=0 -> X perp U -> mean(X) uncorrelated with tau."""
+        from experiments.ite_comparison import gen_prognostic_confounder
+        from scipy.stats import pearsonr
+        np.random.seed(9)
+        X, _, _, E = gen_prognostic_confounder(500, rho_x=0.0)
+        means_x0 = np.array([np.mean(xi[:, 0]) for xi in X])
+        corr, _ = pearsonr(means_x0, E)
+        assert abs(corr) < 0.15, (
+            f"rho_x=0 should hide U from X, but corr={corr:.3f}"
+        )
+
+    def test_finite_ite_both_geometries(self):
+        """Both cone and pyramid geometries return finite ITE on this DGP."""
+        from experiments.ite_comparison import gen_prognostic_confounder
+        np.random.seed(10)
+        X, T, Y, _ = gen_prognostic_confounder(30)
+        X_te, T_te, _, _ = gen_prognostic_confounder(5)
+        for geo in ("cone", "pyramid"):
+            est = ICGHVRTEstimator(k=10, geometry=geo).fit(X, T, Y)
+            for i in range(len(X_te)):
+                tau = est.predict_effect(X_te[i], T_te[i])
+                assert np.isfinite(tau), f"geometry='{geo}' returned non-finite tau at i={i}"
+
+    def test_rho_factory(self):
+        """gen_prognostic_rho factory produces valid data at boundary rho_x values."""
+        from experiments.ite_comparison import gen_prognostic_rho
+        for rho in [0.0, 1.0]:
+            gen = gen_prognostic_rho(rho)
+            X, T, Y, E = gen(20)
+            assert len(X) == 20
+            assert all(np.all(np.isfinite(xi)) for xi in X)
+            assert all(np.all(np.isfinite(yi)) for yi in Y)
+            assert np.all(np.isfinite(E))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -20,6 +20,10 @@ Hidden Confound     U_i ~ N(0,1) unobserved in X.  tau_i = U_i.  X perp U.
 TV Confound         T_{i,t} = 0.5*mean(X_{i,t}) + noise.  Within-patient X->T confounding.
                     tau_i depends on covariance regime.  RMSN/CRN were designed for this.
                     Adversarial to ICG-HVRT: local Ridge sees pooled X but not X_t->T_t link.
+Prognostic Conf     U_i ~ N(0,1) leaks into E[X] and directly affects Y, but T perp U.
+                    No selection confounding -- U is a pure effect modifier observable via X.
+                    Realistic clinical setting: a biomarker predicts treatment response
+                    and is measured in baseline covariates, but treatment is randomised.
 Partial Leak Sweep  Hidden confound with U partially leaking into E[X] via rho_leak.
                     Tests how quickly each method picks up the signal as rho_leak rises.
 
@@ -239,6 +243,67 @@ def gen_outlier_spike(n):
     return X, T, Y, np.array(E)
 
 
+def gen_individual_covariate_leak(n, K=3, leak_amp=8.0):
+    """
+    U_i leaks into a SINGLE covariate (feature 0) at exactly K individual
+    observations.  All other observations and features have no U signal.
+
+    Design (d=4, K=3, N_OBS=100):
+      X_{i,t,0} += U_i * leak_amp  at K randomly chosen t.
+      X_{i,t,1:4} ~ N(0, 1)  for all t  (pure noise features).
+      mean(X_i[:,0]) = U_i * leak_amp * K/N_OBS = 0.24 * U_i  (very weak aggregate).
+      Spike obs: X_{i,spike,0} ~ N(8*U_i, 1)  (strong per-observation signal).
+
+    Contrast with gen_sparse_mean_confounded (K=5, all features, d=2):
+      -- More feature-selective: only dim 0 carries signal.
+      -- Even weaker aggregate: mean ≈ 0.24*U_i (vs 0.30*U_i over 2 dims).
+
+    Scientific hypothesis:
+      S-Learner/R-Learner: use mean(X[:,0]) ≈ 0.24*U_i -> very noisy.
+      CRN/RMSN: GRU processes individual obs -> detects spike directly.
+      ICG-HVRT (cone): spike distorts sample cov -> cone signal available.
+      ICG-HART (pyramid): MAD-whitening robust to spikes -> spike IGNORED.
+    """
+    d = 4
+    X, T, Y, E = [], [], [], []
+    for _ in range(n):
+        U         = np.random.uniform(-1.0, 1.0)
+        tau       = float(U)
+        x         = np.random.normal(0, 1.0, (N_OBS, d))
+        spike_idx = np.random.choice(N_OBS, K, replace=False)
+        x[spike_idx, 0] += U * leak_amp     # only feature 0 at K obs
+        t = np.random.normal(0.5 * U, 1.0, (N_OBS, 1))
+        X.append(x); T.append(t)
+        Y.append(tau * t.flatten() + np.random.normal(0, 0.5, N_OBS))
+        E.append(tau)
+    return X, T, Y, np.array(E)
+
+
+def gen_sparse_k_leak(K: int, leak_amp: float = 8.0):
+    """
+    Factory: DGP where U_i leaks into feature 0 at exactly K individual obs.
+    Used by run_sparse_k_sweep to vary sparsity (K=1 to K=N_OBS).
+
+    At K=N_OBS: equivalent to single-feature mean confounding (full aggregate).
+    At K=1: spike affects only 1 obs; aggregate mean(X[:,0]) = 0.08*U_i.
+    """
+    d = 4
+    def _gen(n):
+        X, T, Y, E = [], [], [], []
+        for _ in range(n):
+            U         = np.random.uniform(-1.0, 1.0)
+            tau       = float(U)
+            x         = np.random.normal(0, 1.0, (N_OBS, d))
+            spike_idx = np.random.choice(N_OBS, min(K, N_OBS), replace=False)
+            x[spike_idx, 0] += U * leak_amp
+            t = np.random.normal(0.5 * U, 1.0, (N_OBS, 1))
+            X.append(x); T.append(t)
+            Y.append(tau * t.flatten() + np.random.normal(0, 0.5, N_OBS))
+            E.append(tau)
+        return X, T, Y, np.array(E)
+    return _gen
+
+
 def gen_partial_leak(rho_leak):
     """
     Return a DGP generator for the partial-leak confounded setting.
@@ -300,25 +365,87 @@ def gen_multi_leak(K: int, rho: float = 0.3):
     return _gen
 
 
+def gen_prognostic_confounder(n, rho_x=0.5, gamma_prog=0.5):
+    """
+    Prognostic confounder: U modifies tau AND outcome baseline, but T perp U.
+
+    U_i ~ N(0,1)              -- unobserved prognostic factor
+    tau_i = U_i               -- U drives treatment effect heterogeneity
+    E[X_{i,t}] = rho_x * U_i -- U leaks into ALL covariates (dense, mean-level)
+    T_{i,t} ~ N(0, 1)         -- fully randomised; T perp U (no selection bias)
+    Y_{i,t} = tau_i * T_{i,t} + gamma_prog * U_i + N(0, 0.5)
+
+    The 'realistic clinical trial' scenario:
+      - A latent biomarker U predicts both who benefits from treatment (tau_i)
+        and the patient's baseline outcome level (direct gamma_prog effect).
+      - U is partially observable via routine measurements X.
+      - Treatment is randomised, so U does not drive selection -- there is
+        NO confounding bias in the standard causal sense.
+      - The challenge is pure effect-modification / heterogeneity recovery:
+        methods that exploit X to estimate U will recover tau_i;
+        methods that deconfound U->T (e.g. CRN adversarial) gain nothing
+        since T_bar ~ 0 for all patients (T already randomised).
+
+    Contrast with gen_hidden_confounded (U->T, X perp U -- all methods fail)
+    and gen_mean_confounded (U->T AND U->X -- deconfounding methods win).
+    Here: U->X (observable) but NOT U->T -- deconfounding is idle;
+    heterogeneity recovery via X is the only signal.
+    """
+    d = 4
+    X, T, Y, E = [], [], [], []
+    for _ in range(n):
+        U   = np.random.normal(0, 1)
+        tau = float(U)
+        x   = np.random.normal(rho_x * U * np.ones(d), 1.0, (N_OBS, d))
+        t   = np.random.normal(0, 1.0, (N_OBS, 1))               # T perp U
+        y   = tau * t.flatten() + gamma_prog * U + np.random.normal(0, 0.5, N_OBS)
+        X.append(x); T.append(t)
+        Y.append(y)
+        E.append(tau)
+    return X, T, Y, np.array(E)
+
+
+def gen_prognostic_rho(rho_x: float, gamma_prog: float = 0.5):
+    """
+    Factory: prognostic confounder with variable leak strength rho_x in [0, 1].
+
+    rho_x=0  -> X perp U; all methods fail (heterogeneity fully hidden)
+    rho_x=0.5 -> moderate leak; methods exploiting mean(X) should improve
+    rho_x=1.0 -> strong leak; mean(X) ~ U_i; near-full heterogeneity recovery
+    """
+    def _gen(n):
+        return gen_prognostic_confounder(n, rho_x=rho_x, gamma_prog=gamma_prog)
+    _gen.__name__ = f"prog_rho_{rho_x:.1f}"
+    return _gen
+
+
 TESTS = [
     ("Randomised",           gen_randomised),
     ("Geometric Confounded", gen_geometric_confounded),
     ("Mean Confounded",      gen_mean_confounded),
     ("Sparse Mean Conf",     gen_sparse_mean_confounded),
+    ("Indiv Feature Leak",   gen_individual_covariate_leak),
+    ("Prognostic Conf",      gen_prognostic_confounder),
     ("Hidden Confounded",    gen_hidden_confounded),
     ("TV Confounded",        gen_tv_confounded),
     ("Outlier Spike",        gen_outlier_spike),
 ]
 
-METHODS            = ["Within-Patient", "S-Learner", "R-Learner", "CRN", "RMSN", "ICG-HVRT", "ICG-HART"]
+METHODS            = ["Within-Patient", "S-Learner", "R-Learner", "CRN", "RMSN", "ICG-HVRT", "ICG-HART", "ICG-Synergy"]
 LEAK_METHODS       = ["S-Learner", "R-Learner", "CRN", "RMSN", "ICG-HVRT"]
+SPARSE_K_VALUES    = [1, 3, 10, 30, 100]
+N_SEEDS_SPARSE     = 5
+SPARSE_LEAK_METHODS = ["S-Learner", "R-Learner", "CRN", "ICG-HVRT", "ICG-HART"]
+PROG_RHO_VALUES    = [0.0, 0.1, 0.25, 0.5, 1.0]
+N_SEEDS_PROG       = 5
+PROG_METHODS       = ["S-Learner", "R-Learner", "CRN", "ICG-HVRT", "ICG-HART"]
 MULTI_LEAK_K       = [1, 2, 4, 8]
 MULTI_LEAK_RHO     = 0.3
 MULTI_LEAK_METHODS = ["S-Learner", "R-Learner", "CRN", "GRU-NoAdv", "ICG-HVRT"]
 N_SEEDS_MULTI      = 5
 NOISE_SIGMAS       = [0.5, 1.0, 2.0, 4.0, 8.0]   # observation noise on X
 N_SEEDS_NOISE      = 5
-METRICS            = ["pehe", "mae", "nmae", "bias", "spearman", "sign_acc", "n_regret"]
+METRICS            = ["pehe", "mae", "nmae", "bias", "spearman", "sign_acc", "regret", "n_regret"]
 
 
 # ═══════════════════════════════════════════════════════════════════════ #
@@ -605,12 +732,29 @@ def _icg_hvrt(X_tr, T_tr, Y_tr, X_te, T_te, k=30, n_partitions=8,
 
 def _icg_hart(X_tr, T_tr, Y_tr, X_te, T_te, k=30, n_partitions=8,
               gamma_levels_perp=0.25):
-    """ICG-HART: MAD-based pyramid geometry + local Ridge (pre-treatment)."""
+    """ICG-HART: MAD-based pyramid geometry + lad local model (pre-treatment)."""
     est = ICGHVRTEstimator(
         matcher=ICGHVRTMatcher(auto_calibrate=True,
                                gamma_levels_perp=gamma_levels_perp),
         k=k, n_partitions=n_partitions, learn_weights=True,
         geometry='pyramid',
+    )
+    est.fit(X_tr, T_tr, Y_tr)
+    return np.array([est.predict_effect(X_te[i], T_te[i]) for i in range(len(X_te))])
+
+
+def _icg_synergy(X_tr, T_tr, Y_tr, X_te, T_te, k=30, n_partitions=8):
+    """ICG-Synergy: PyramidHART spike detection → HVRT on clean bulk + lad local model.
+
+    Two-stage pipeline per the cooperation design (Peace 2026, §4.3):
+      Stage 1 — PyramidHART identifies spike samples via |A|/‖z‖₁ (Prop 1.3).
+      Stage 2 — HVRT fitted on spike-free bulk; Theorem 3 noise invariance holds.
+    Cone geometry (ConeIdentity) uses full MAD stats (already spike-robust).
+    """
+    est = ICGHVRTEstimator(
+        matcher=ICGHVRTMatcher(auto_calibrate=True),
+        k=k, n_partitions=n_partitions, learn_weights=True,
+        geometry='synergy',
     )
     est.fit(X_tr, T_tr, Y_tr)
     return np.array([est.predict_effect(X_te[i], T_te[i]) for i in range(len(X_te))])
@@ -663,6 +807,7 @@ def evaluate_once(generator, seed):
     out["RMSN"]           = compute_metrics(_rmsn_learner(X_tr, T_tr, Y_tr, X_te), E_te)
     out["ICG-HVRT"]       = compute_metrics(_icg_hvrt(X_tr, T_tr, Y_tr, X_te, T_te), E_te)
     out["ICG-HART"]       = compute_metrics(_icg_hart(X_tr, T_tr, Y_tr, X_te, T_te), E_te)  # PyramidHART
+    out["ICG-Synergy"]    = compute_metrics(_icg_synergy(X_tr, T_tr, Y_tr, X_te, T_te), E_te)
     return out
 
 
@@ -716,6 +861,7 @@ _COLORS = {
     "S-Learner":      "#E74C3C",
     "R-Learner":      "#3498DB",
     "ICG-HART":       "#1ABC9C",  # teal — distinguishable from HVRT green
+    "ICG-Synergy":    "#D35400",  # burnt orange — two-stage pipeline
     "CRN":            "#9B59B6",
     "RMSN":           "#F39C12",
     "GRU-NoAdv":      "#E67E22",
@@ -1081,12 +1227,188 @@ def plot_noise_resilience(results, save_path="noise_resilience.png"):
 
 
 # ═══════════════════════════════════════════════════════════════════════ #
+#  Prognostic confounder rho sweep                                        #
+# ═══════════════════════════════════════════════════════════════════════ #
+
+def run_prognostic_rho_sweep():
+    """
+    Evaluate PROG_METHODS as rho_x (U leak strength into X) varies from 0 to 1.
+
+    At rho_x=0  -> X perp U -> all methods fail (pure hidden heterogeneity).
+    At rho_x=1  -> mean(X) ~ U_i -> strong signal; all X-using methods improve.
+    T is always randomised (T perp U), so deconfounding methods gain nothing
+    from attempting to remove U->T correlation -- they are in 'idle' mode.
+
+    This tests pure heterogeneity recovery via covariate signal, without any
+    selection confounding to cloud the picture.
+    """
+    results = {m: {r: [] for r in PROG_RHO_VALUES} for m in PROG_METHODS}
+
+    for rho_x in PROG_RHO_VALUES:
+        gen = gen_prognostic_rho(rho_x)
+        print(f"  rho_x={rho_x:.2f}  (mean(X) ~ {rho_x:.2f}*U_i,  std(tau)=1.0)",
+              end="", flush=True)
+        for s in range(N_SEEDS_PROG):
+            np.random.seed(s * 137 + 13)
+            torch.manual_seed(s * 137 + 13)
+            X_tr, T_tr, Y_tr, _    = gen(N_TRAIN)
+            np.random.seed(s * 137 + 13 + 100_000)
+            X_te, T_te, Y_te, E_te = gen(N_TEST)
+
+            F_tr, Tbar_tr, Ybar_tr = patient_summaries(X_tr, T_tr, Y_tr)
+            F_te, _,       _        = patient_summaries(X_te, T_te, Y_te)
+
+            results["S-Learner"][rho_x].append(
+                compute_metrics(_s_learner(F_tr, Tbar_tr, Ybar_tr, F_te), E_te)["pehe"])
+            results["R-Learner"][rho_x].append(
+                compute_metrics(_r_learner(F_tr, Tbar_tr, Ybar_tr, F_te), E_te)["pehe"])
+            results["CRN"][rho_x].append(
+                compute_metrics(_crn_learner(X_tr, T_tr, Y_tr, X_te), E_te)["pehe"])
+            results["ICG-HVRT"][rho_x].append(
+                compute_metrics(_icg_hvrt(X_tr, T_tr, Y_tr, X_te, T_te), E_te)["pehe"])
+            results["ICG-HART"][rho_x].append(
+                compute_metrics(_icg_hart(X_tr, T_tr, Y_tr, X_te, T_te), E_te)["pehe"])
+            print(".", end="", flush=True)
+        print()
+
+    return results
+
+
+def plot_prognostic_rho_sweep(results, save_path="prognostic_rho_sweep.png"):
+    """
+    Line plot: sqrt-PEHE vs rho_x for each method.
+
+    rho_x=0 -> all methods converge to std(tau) ~ 1.0 (hidden heterogeneity).
+    Rising curves at rho_x>0 indicate a method is exploiting the covariate leak.
+    Flat curves indicate the method cannot use X to detect tau heterogeneity.
+    """
+    prog_colors = {m: _COLORS.get(m, "#95A5A6") for m in PROG_METHODS}
+    rhos = PROG_RHO_VALUES
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for m in PROG_METHODS:
+        means = [float(np.mean(results[m][r])) for r in rhos]
+        stds  = [float(np.std( results[m][r])) for r in rhos]
+        ax.plot(rhos, means, "o-", label=m, color=prog_colors[m], lw=2, markersize=7)
+        lo = [mu - s for mu, s in zip(means, stds)]
+        hi = [mu + s for mu, s in zip(means, stds)]
+        ax.fill_between(rhos, lo, hi, alpha=0.15, color=prog_colors[m])
+
+    ax.set_xlabel(
+        "rho_x  (U leak strength into E[X];  T is randomised, T perp U)\n"
+        "  rho_x=0: fully hidden heterogeneity        rho_x=1: full mean leak -->"
+    )
+    ax.set_ylabel("sqrt-PEHE  (lower is better)")
+    ax.set_title(
+        "Prognostic confounder: heterogeneity recovery vs X-leak strength\n"
+        "T randomised -- no selection confounding; challenge is pure effect-modification"
+    )
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=130, bbox_inches="tight")
+    print(f"  Saved: {save_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════ #
+#  Sparse-K individual feature leak sweep                                 #
+# ═══════════════════════════════════════════════════════════════════════ #
+
+def run_sparse_k_sweep():
+    """
+    Evaluate SPARSE_LEAK_METHODS as K (number of spike obs carrying U signal)
+    varies from 1 (extremely sparse) to N_OBS (full aggregate leakage).
+
+    All DGPs use the same single-feature leak (feature 0) with leak_amp=8.0.
+
+    Expected pattern:
+      K=N_OBS  -- everyone sees strong mean(X[:,0]) = 8*U_i -> all methods good.
+      K small  -- aggregate signal = 8*U_i*K/N_OBS -> S/R-Learner degrade fast.
+                  GRU-based (CRN): processes individual timesteps -> more robust.
+                  ICG-HVRT (cone): spike distorts sample cov -> partial signal.
+                  ICG-HART (pyramid): MAD-robust -> spike invisible -> degrades.
+
+    This reveals which methods exploit individual-observation structure vs
+    requiring the confounder to appear in patient-level aggregate statistics.
+    """
+    results = {m: {K: [] for K in SPARSE_K_VALUES} for m in SPARSE_LEAK_METHODS}
+
+    for K in SPARSE_K_VALUES:
+        gen = gen_sparse_k_leak(K, leak_amp=8.0)
+        agg_pct = K / N_OBS * 100
+        print(f"  K={K:3d}  (mean leak = {8.0*K/N_OBS:.2f}*U_i,  {agg_pct:.0f}% of obs)",
+              end="", flush=True)
+        for s in range(N_SEEDS_SPARSE):
+            np.random.seed(s * 137 + 7)
+            torch.manual_seed(s * 137 + 7)
+            X_tr, T_tr, Y_tr, _    = gen(N_TRAIN)
+            np.random.seed(s * 137 + 7 + 100_000)
+            X_te, T_te, Y_te, E_te = gen(N_TEST)
+
+            F_tr, Tbar_tr, Ybar_tr = patient_summaries(X_tr, T_tr, Y_tr)
+            F_te, _,       _        = patient_summaries(X_te, T_te, Y_te)
+
+            results["S-Learner"][K].append(
+                compute_metrics(_s_learner(F_tr, Tbar_tr, Ybar_tr, F_te), E_te)["pehe"])
+            results["R-Learner"][K].append(
+                compute_metrics(_r_learner(F_tr, Tbar_tr, Ybar_tr, F_te), E_te)["pehe"])
+            results["CRN"][K].append(
+                compute_metrics(_crn_learner(X_tr, T_tr, Y_tr, X_te), E_te)["pehe"])
+            results["ICG-HVRT"][K].append(
+                compute_metrics(_icg_hvrt(X_tr, T_tr, Y_tr, X_te, T_te), E_te)["pehe"])
+            results["ICG-HART"][K].append(
+                compute_metrics(_icg_hart(X_tr, T_tr, Y_tr, X_te, T_te), E_te)["pehe"])
+            print(".", end="", flush=True)
+        print()
+
+    return results
+
+
+def plot_sparse_k_sweep(results, save_path="sparse_k_sweep.png"):
+    """
+    Line plot: sqrt-PEHE vs K (log x-axis) for each method.
+
+    Flatter curves at small K -> method exploits individual-observation signal.
+    Sharp increase at small K -> method requires aggregate (mean) signal only.
+    """
+    sparse_colors = {m: _COLORS.get(m, "#95A5A6") for m in SPARSE_LEAK_METHODS}
+    Ks = SPARSE_K_VALUES
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for m in SPARSE_LEAK_METHODS:
+        means = [float(np.mean(results[m][K])) for K in Ks]
+        stds  = [float(np.std( results[m][K])) for K in Ks]
+        ax.plot(Ks, means, "o-", label=m, color=sparse_colors[m], lw=2, markersize=7)
+        lo = [mu - s for mu, s in zip(means, stds)]
+        hi = [mu + s for mu, s in zip(means, stds)]
+        ax.fill_between(Ks, lo, hi, alpha=0.15, color=sparse_colors[m])
+
+    ax.set_xscale("log")
+    ax.set_xticks(Ks)
+    ax.set_xticklabels([str(K) for K in Ks])
+    ax.set_xlabel(
+        f"K  (# obs carrying U signal per patient,  leak_amp=8.0,  N_OBS={N_OBS})\n"
+        "  <-- sparse individual-level        aggregate (all obs) -->"
+    )
+    ax.set_ylabel("sqrt-PEHE  (lower is better)")
+    ax.set_title(
+        "Individual vs aggregate feature leak: PEHE vs sparsity K\n"
+        "Single-feature confound (feature 0 only); ICG-HART uses MAD-robust matching"
+    )
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=130, bbox_inches="tight")
+    print(f"  Saved: {save_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════ #
 #  Main                                                                   #
 # ═══════════════════════════════════════════════════════════════════════ #
 
 if __name__ == "__main__":
     print("=" * 72)
-    print("  ITE COMPARISON: ICG-HVRT vs S/R-Learner vs CRN vs RMSN under confounding")
+    print("  ITE COMPARISON: ICG-HVRT/HART vs S/R-Learner vs CRN vs RMSN under confounding")
     print(f"  {N_SEEDS} seeds x {len(TESTS)} DGPs  |  {N_TRAIN} train / {N_TEST} test / {N_OBS} obs per patient")
     print("=" * 72)
 
@@ -1314,4 +1636,46 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.savefig("coop_distance_validation.png", dpi=130, bbox_inches="tight")
     print("\n  Saved: coop_distance_validation.png")
+
+    # ── Sparse-K individual feature leak sweep ───────────────────────
+    print("\n" + "=" * 72)
+    print(f"  SPARSE-K INDIVIDUAL FEATURE LEAK SWEEP  --  K in {SPARSE_K_VALUES}")
+    print(f"  {N_SEEDS_SPARSE} seeds x {len(SPARSE_K_VALUES)} K values x {len(SPARSE_LEAK_METHODS)} methods")
+    print("  Feature 0 only; leak_amp=8.0.  K=1 -> nearly hidden; K=100 -> full mean leak.")
+    print("=" * 72 + "\n")
+    sparse_results = run_sparse_k_sweep()
+
+    print("\n  sqrt-PEHE by K (lower is better):")
+    sk_hdr = f"{'Method':<{col_w}}" + "".join(f"     K={K}" for K in SPARSE_K_VALUES)
+    print(sk_hdr)
+    print("-" * (col_w + 9 * len(SPARSE_K_VALUES)))
+    for m in SPARSE_LEAK_METHODS:
+        row = f"{m:<{col_w}}" + "".join(
+            f"  {float(np.mean(sparse_results[m][K])):>6.4f}" for K in SPARSE_K_VALUES)
+        print(row)
+
+    print("\n[Generating sparse-K sweep plot...]")
+    plot_sparse_k_sweep(sparse_results, save_path="sparse_k_sweep.png")
+
+    # ── Prognostic confounder rho sweep ──────────────────────────────
+    print("\n" + "=" * 72)
+    print(f"  PROGNOSTIC CONFOUNDER SWEEP  --  rho_x in {PROG_RHO_VALUES}")
+    print(f"  {N_SEEDS_PROG} seeds x {len(PROG_RHO_VALUES)} rho values x {len(PROG_METHODS)} methods")
+    print("  T perp U (randomised); U leaks into mean(X) and directly affects Y.")
+    print("  Tests pure heterogeneity recovery via covariate signal.")
+    print("=" * 72 + "\n")
+    prog_results = run_prognostic_rho_sweep()
+
+    print("\n  sqrt-PEHE by rho_x (lower is better):")
+    pr_hdr = f"{'Method':<{col_w}}" + "".join(f"  r={r:.2f}" for r in PROG_RHO_VALUES)
+    print(pr_hdr)
+    print("-" * (col_w + 9 * len(PROG_RHO_VALUES)))
+    for m in PROG_METHODS:
+        row = f"{m:<{col_w}}" + "".join(
+            f"  {float(np.mean(prog_results[m][r])):>6.4f}" for r in PROG_RHO_VALUES)
+        print(row)
+
+    print("\n[Generating prognostic rho sweep plot...]")
+    plot_prognostic_rho_sweep(prog_results, save_path="prognostic_rho_sweep.png")
+
     print("\nDone.")
