@@ -45,7 +45,7 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         # No api_token needed when using Trusted Publisher (OIDC).
         # To configure: PyPI project -> Publishing -> Add Publisher
-        #   Owner: jpeaceau  Repo: AutoITE  Workflow: publish.yml
+        #   Owner: jpeaceau  Repo: AutoITE  Workflow: build_wheels.yml
         # Fallback: set PYPI_API_TOKEN secret and uncomment below:
         # with:
         #   password: ${{ secrets.PYPI_API_TOKEN }}

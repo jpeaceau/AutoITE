@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autoite"
-version = "2.1.0"
+version = "2.2.0"
 description = "Individual Treatment Effect estimation via Intrinsic Causal Geometry (ICG-HVRT cone + ICG-HART pyramid)"
 license = "AGPL-3.0"
 requires-python = ">=3.10"
