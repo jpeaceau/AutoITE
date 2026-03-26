@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.9", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "autoite"
@@ -19,19 +19,6 @@ dependencies = [
 dev     = ["pytest>=7", "pytest-cov", "build"]
 cpp-dev = ["scikit-build-core>=0.10", "pybind11>=3.0"]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["autoite*"]
-exclude = ["tests*", "experiments*", ".venv*"]
-
-# ── scikit-build-core configuration (used when build-backend is switched) ── #
-# To build with C++ extension:
-#   pip install scikit-build-core pybind11
-#   EIGEN3_INCLUDE_DIR=<path> pip install -e . --no-build-isolation \
-#       --config-settings="build-system.requires=['scikit-build-core','pybind11']" \
-#       --config-settings="build-system.build-backend=scikit_build_core.build"
-#
-# Or simply: build_ext.bat   (Windows; uses VS 2019 Build Tools)
 [tool.ruff.lint]
 select = ["E", "F", "W"]
 ignore = ["E501"]   # line-length checked by formatter, not linter
